@@ -4,13 +4,14 @@
   "codex_sessions_dir": "%USERPROFILE%/.codex/sessions",
   "codex_global_state_path": "%USERPROFILE%/.codex/.codex-global-state.json",
   "actions": {
-    "startup": "期待.gif",
+    "startup": "待机.gif",
     "idle": "待机.gif",
     "thinking": "思考.gif",
     "ready": "拿笔待机.gif",
     "running": "连续绘制.gif",
     "running_intermittent": "间歇绘制.gif",
-    "complete": "得意.gif"
+    "complete": "得意.gif",
+    "drag": "期待.gif"
   },
   "display": {
     "persistent": true,
