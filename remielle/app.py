@@ -87,6 +87,17 @@ class BridgeApp:
 
     # ── State machine: central dispatcher ──────────────────────────
 
+    _MODE_LABELS: dict[str, str] = {
+        "hidden": "已隐藏",
+        "startup": "启动中",
+        "idle": "待机中",
+        "thinking": "思考中",
+        "running": "工作中",
+        "running_intermittent": "间歇工作中",
+        "review": "任务完成待查看",
+        "ready": "有未读消息",
+    }
+
     def _transition_to(self, mode: str) -> None:
         """Central dispatcher: change display mode, logging the transition."""
         if mode == self.display_mode:
@@ -94,6 +105,12 @@ class BridgeApp:
         old = self.display_mode
         self.display_mode = mode
         LOGGER.info("display transition: %s → %s", old, mode)
+        # Update tray tooltip — only called on actual transitions, not
+        # every poll cycle, so NIM_MODIFY is cheap.
+        tray = getattr(self.window, "_tray", None)
+        if tray:
+            label = self._MODE_LABELS.get(mode, mode)
+            tray.set_tip(f"蕾米 · {label}")
         getattr(self, f"_go_{mode}")()
 
     def _go_startup(self) -> None:
@@ -199,6 +216,88 @@ class BridgeApp:
             self.pending_reviews.pop(thread_id, None)
             LOGGER.info("task result read: thread=%s", thread_id)
 
+    @staticmethod
+    def _determine_target(
+        *,
+        codex_active: bool,
+        claude_busy: bool,
+        codex_last_activity: float,
+        now: float,
+        has_pending_reviews: bool,
+        has_unread: bool,
+        persistent: bool,
+        auto_hide_complete: bool,
+        think_timeout: float,
+        intermittent_timeout: float,
+        current_mode: str,
+    ) -> str:
+        """Pure function: compute the next display mode from watcher signals.
+
+        DESIGN RULES (regression-tested):
+        ─────────────────────────────────
+        1. Codex provides high-frequency activity signals (JSONL lines every
+           ~100 ms).  Gap-based degradation (running → intermittent →
+           thinking) is meaningful because the gap reflects real output gaps.
+
+        2. Claude Code provides low-frequency activity signals (session JSON
+           file writes every 5-30 s).  When Claude is the **only** active
+           tool, gap-based degradation is meaningless — we cannot distinguish
+           "streaming tokens" from "reasoning" between file writes.  In that
+           case we treat the activity timer as continuously fresh.
+
+        3. When BOTH tools are active, Codex's high-frequency signal drives
+           the degradation timeline.  Claude's binary busy/idle only
+           contributes to the ``effective_active`` flag.
+
+        4. If a third tool watcher is added, YOU MUST DECLARE its signal
+           frequency here and handle it in the ``# <-- SIGNAL FREQUENCY``
+           block below.  Do NOT silently merge a low-frequency watcher into
+           the gap-based path.
+        """
+        # ══ Activity merge — each watcher declares its signal frequency ══
+        effective_active = codex_active or claude_busy
+
+        if codex_active:
+            # High-frequency → gap-based degradation applies
+            effective_last_activity = codex_last_activity
+        elif claude_busy:
+            # Low-frequency → treat as continuously fresh
+            # <-- SIGNAL FREQUENCY: new watchers go here
+            effective_last_activity = now
+        else:
+            effective_last_activity = 0.0
+
+        gap = (now - effective_last_activity
+               if effective_last_activity > 0 else 0.0)
+
+        # ══ Priority-ordered target selection ══
+        if effective_active:
+            if gap > think_timeout:
+                target = "thinking"
+            elif gap > intermittent_timeout:
+                target = "running_intermittent"
+            else:
+                target = "running"
+        elif has_pending_reviews:
+            target = "review"
+        elif has_unread:
+            target = "ready"
+        elif persistent:
+            target = "idle"
+        else:
+            target = "hidden"
+
+        # ══ Mode-specific exit transitions ══
+        if current_mode == "review" and not has_pending_reviews:
+            if auto_hide_complete and not persistent:
+                target = "hidden"
+            elif has_unread:
+                target = "ready"
+            else:
+                target = "idle"
+
+        return target
+
     def _poll(self) -> None:
         if not self.running:
             return
@@ -219,8 +318,6 @@ class BridgeApp:
                     }
 
             # Feed Claude Code busy→idle transitions into the same pipeline.
-            # Claude Code has no "unread" concept, so completions always
-            # auto-resolve after settle_seconds (default ~2.5 s).
             for comp in claude_completions:
                 if comp.get("thread_id"):
                     self.pending_reviews[comp["thread_id"]] = {
@@ -230,53 +327,20 @@ class BridgeApp:
 
             self._update_reviews(unread)
 
-            # ── Determine the correct display mode ──
-            display_cfg = self.config["display"]
-            persistent = display_cfg["persistent"]
-            auto_hide_complete = display_cfg["auto_hide_after_complete"]
-            thresholds = self.config["activity_thresholds"]
-            think_timeout = float(thresholds["thinking_timeout_seconds"])
-            intermittent_timeout = float(thresholds["intermittent_timeout_seconds"])
             now = time.monotonic()
-
-            # Merge Codex + Claude Code into a unified active/idle signal.
-            # Codex provides per-turn activity via its JSONL stream; Claude
-            # Code provides a binary busy/idle via its session JSON file.
-            codex_active = after > 0
-            effective_active = codex_active or claude_busy
-            effective_last_activity = last_activity
-            if claude_last_activity > effective_last_activity:
-                effective_last_activity = claude_last_activity
-
-            # Compute gap since last activity (from either tool)
-            gap = (now - effective_last_activity
-                   if effective_last_activity > 0 else float("inf"))
-
-            # Determine target mode
-            if effective_active:
-                if effective_last_activity == 0.0 or gap > think_timeout:
-                    target = "thinking"
-                elif gap > intermittent_timeout:
-                    target = "running_intermittent"
-                else:
-                    target = "running"
-            elif self.pending_reviews:
-                target = "review"
-            elif unread and self._unread_is_meaningful(now):
-                target = "ready"
-            elif persistent:
-                target = "idle"
-            else:
-                target = "hidden"
-
-            # Review → idle/hidden transition when reviews clear
-            if self.display_mode == "review" and not self.pending_reviews:
-                if auto_hide_complete and not persistent:
-                    target = "hidden"
-                elif unread and self._unread_is_meaningful(now):
-                    target = "ready"
-                else:
-                    target = "idle"
+            target = self._determine_target(
+                codex_active=after > 0,
+                claude_busy=claude_busy,
+                codex_last_activity=last_activity,
+                now=now,
+                has_pending_reviews=bool(self.pending_reviews),
+                has_unread=bool(unread) and self._unread_is_meaningful(now),
+                persistent=self.config["display"]["persistent"],
+                auto_hide_complete=self.config["display"]["auto_hide_after_complete"],
+                think_timeout=float(self.config["activity_thresholds"]["thinking_timeout_seconds"]),
+                intermittent_timeout=float(self.config["activity_thresholds"]["intermittent_timeout_seconds"]),
+                current_mode=self.display_mode,
+            )
 
             # Hidden → visible transition when something happens
             if self.display_mode == "hidden" and target != "hidden":
@@ -290,18 +354,8 @@ class BridgeApp:
 
             # Push a snapshot of bridge state to the window so the
             # right-click menu always shows current info.
-            _MODE_LABELS: dict[str, str] = {
-                "hidden": "已隐藏",
-                "startup": "启动中",
-                "idle": "待机中",
-                "thinking": "思考中",
-                "running": "工作中",
-                "running_intermittent": "间歇工作中",
-                "review": "任务完成待查看",
-                "ready": "有未读消息",
-            }
             self.window.set_status_info({
-                "mode": _MODE_LABELS.get(self.display_mode, self.display_mode),
+                "mode": self._MODE_LABELS.get(self.display_mode, self.display_mode),
                 "active": str(after) if after else "",
                 "unread": str(len(unread)) if unread else "",
                 "claude": "忙碌" if claude_busy else "空闲",
@@ -345,8 +399,21 @@ class BridgeApp:
         self.window.root.after(interval, self._poll)
 
     def stop(self) -> None:
+        """Unified exit — safe to call multiple times.
+
+        All exit paths (tray menu, window menu, future hotkeys) funnel
+        through here so cleanup is guaranteed exactly once.
+        """
+        if not self.running:
+            return
         self.running = False
         self.window.animation_token += 1
+
+        tray = getattr(self.window, "_tray", None)
+        if tray is not None:
+            tray.destroy()
+            self.window._tray = None
+
         self.window.root.destroy()
 
 

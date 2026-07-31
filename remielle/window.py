@@ -85,6 +85,7 @@ class RemielleWindow:
         self.drag_origin: tuple[int, int, int, int] | None = None
         self._drag_previous_action: str | None = None
         self._drag_previous_loops: int | None = None
+        self._resume_after_tray: bool = False
         # ── GIF frame cache ──
         # Key: gif_name, Value: (frames, delays)
         self._frame_cache: dict[str, tuple[list[ImageTk.PhotoImage], list[int]]] = {}
@@ -101,6 +102,9 @@ class RemielleWindow:
         if sys.platform == "win32":
             self.root.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
         self.root.configure(bg=TRANSPARENT_COLOR)
+        # Closing the window should hide it, not destroy it — the tray
+        # icon stays alive so the user can bring the pet back.
+        self.root.protocol("WM_DELETE_WINDOW", self.hide)
         # Retrieve the native window handle *after* the window is mapped
         # so we can toggle click-through behaviour.
         self._hwnd: int = 0
@@ -111,6 +115,12 @@ class RemielleWindow:
                 self._hwnd = 0
             if self._hwnd:
                 _win32_remove_window_border(self._hwnd)
+                # ── System-tray icon ──
+                icon_path = self.asset_dir.parent / "remielle.ico"
+                if icon_path.exists():
+                    from .tray import TrayIcon
+                    self._tray = TrayIcon(
+                        self._hwnd, self, str(icon_path), "蕾米 AI 助手")
 
         self.canvas = tk.Canvas(
             self.root,
@@ -396,6 +406,37 @@ class RemielleWindow:
         self.set_status_text("等待 AI 任务")
         LOGGER.info("window hidden")
 
+    def hide_to_tray(self) -> None:
+        """Temporarily hide the pet while keeping animation state.
+
+        Unlike ``hide()`` (which is used by the state machine and
+        intentionally kills the animation timer), this preserves
+        ``frame_index`` / ``current_action`` / ``loops_remaining``
+        so ``restore_from_tray()`` can pick up where it left off.
+        """
+        if self.root.state() == "withdrawn":
+            return
+        self.set_clickthrough(False)
+        self.animation_token += 1  # stop current render chain
+        self._resume_after_tray = bool(self.frames)
+        self.root.withdraw()
+        self.visible = False
+        LOGGER.info("window hidden to tray")
+
+    def restore_from_tray(self) -> None:
+        """Restore the pet window and resume the paused animation."""
+        if self.root.state() != "withdrawn":
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self.visible = True
+        if self._resume_after_tray and self.frames:
+            self._resume_after_tray = False
+            self.animation_token += 1
+            token = self.animation_token
+            self._render_frame(token)
+        LOGGER.info("window restored from tray")
+
     # ── Menu demo & self-test ────────────────────────────────────
 
     def _menu_demo_all(self) -> None:
@@ -455,13 +496,17 @@ class RemielleWindow:
     def _open_menu(self, event: tk.Event) -> None:
         self.show_menu_at(event.x_root, event.y_root)
 
-    def show_menu_at(self, x: int, y: int) -> None:
+    def show_menu_at(self, x: int, y: int,
+                      source: str = "window") -> None:
         """Post the right-click context menu at screen position (x, y).
 
         Uses Windows native ``TrackPopupMenu`` instead of ``tk_popup``.
         Native menus are rendered by the OS outside Tk's window system,
         so the overrideredirect / transparent-color window can never
         cause z-order flicker.
+
+        *source* distinguishes tray-icon right-clicks from window
+        right-clicks so the menu can show different items for each.
         """
         if sys.platform != "win32":
             return  # native menus are Windows-only; silently skip on macOS/Linux
@@ -470,17 +515,22 @@ class RemielleWindow:
             self.root.attributes("-topmost", False)
         self._menu_active = True
         try:
-            self._native_show_menu(x, y)
+            self._native_show_menu(x, y, source=source)
         finally:
             self._menu_active = False
             if was_topmost:
                 self.root.attributes("-topmost", True)
 
-    def _native_show_menu(self, x: int, y: int) -> None:
+    def _native_show_menu(self, x: int, y: int,
+                           source: str = "window") -> None:
         """Build a native Win32 popup menu and post it at (x, y).
 
         The menu is built fresh each time so it always reflects the
         current status, scale, toggle state, and autostart label.
+
+        *source* is ``"window"`` for right-click on the pet and
+        ``"tray"`` for right-click on the tray icon — the latter
+        shows a "退出" item that fully terminates the process.
         """
         menu = _native_create_menu()
         submenus: list[int] = []  # track submenus for cleanup
@@ -552,13 +602,27 @@ class RemielleWindow:
         add_item(self._autostart_label, self._toggle_autostart)
         _native_add_sep(menu)
 
+        # ── Show / Hide (tray only) ──────────────────────────
+        if source == "tray":
+            if self.root.state() == "withdrawn":
+                add_item("显示桌宠", self.restore_from_tray)
+            else:
+                add_item("隐藏桌宠", self.hide_to_tray)
+            _native_add_sep(menu)
+
         # ── Exit ─────────────────────────────────────────────
-        add_item("退出状态桥", self.on_exit)
+        if source == "tray":
+            add_item("退出蕾米 AI 助手", self._exit_app)
+        else:
+            add_item("退出状态桥", self.on_exit)
 
         # ── Show & dispatch ──────────────────────────────────
         callback: Callable[[], None] | None = None
         try:
             cmd = _native_track(menu, self._hwnd, x, y)
+            LOGGER.debug(
+                "native menu: source=%s cmd=%d", source, cmd,
+            )
             if cmd and cmd in dispatch:
                 callback = dispatch[cmd]
         finally:
@@ -571,6 +635,10 @@ class RemielleWindow:
         # destroyed — no re-entrancy risk with the event loop.
         if callback is not None:
             callback()
+
+    def _exit_app(self) -> None:
+        """Full exit — all cleanup is handled by ``BridgeApp.stop()``."""
+        self.on_exit()
 
     # ── Behaviour toggles ────────────────────────────────────────
 

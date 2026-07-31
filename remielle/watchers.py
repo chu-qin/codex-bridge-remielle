@@ -371,6 +371,7 @@ class ClaudeSessionWatcher:
 
         busy = False
         latest_mtime = 0.0
+        latest_busy_mtime = 0.0
         busy_pid = 0
         current_busy_pids: set[int] = set()
 
@@ -391,9 +392,27 @@ class ClaudeSessionWatcher:
                 updated_at = data.get("updatedAt", 0)
                 if data.get("status") == "busy":
                     if pid and _pid_is_alive(pid):
+                        # ── Busy-staleness guard ──
+                        # ``updatedAt`` is a JS epoch (milliseconds since
+                        # 1970).  If it hasn't changed in a long time while
+                        # the status is still "busy", the session is stale —
+                        # the owning process may be hung or the session file
+                        # wasn't cleaned up properly.
+                        now_ms = int(time.time() * 1000)
+                        stale_cutoff_ms = now_ms - 1_800_000  # 30 min
+                        if updated_at > 0 and updated_at < stale_cutoff_ms:
+                            LOGGER.info(
+                                "claude session: ignoring stale busy pid=%d "
+                                "(updatedAt age=%d min)",
+                                pid,
+                                (now_ms - updated_at) // 60_000,
+                            )
+                            continue  # treat as not-busy
                         busy = True
                         busy_pid = pid
                         current_busy_pids.add(pid)
+                        if mtime > latest_busy_mtime:
+                            latest_busy_mtime = mtime
                         # Track session info so we can emit a rich
                         # completion event when it transitions to idle.
                         if pid not in self._busy_sessions:
@@ -407,7 +426,7 @@ class ClaudeSessionWatcher:
                         # tool calls, etc.).  We use it as a high-res
                         # proxy for "the model is producing output."
                         prev_ua = self._updated_ats.get(pid, 0)
-                        if updated_at > prev_ua and prev_ua > 0:
+                        if updated_at > prev_ua:
                             self._last_activity_monotonic = time.monotonic()
                         self._updated_ats[pid] = updated_at
         except OSError:
@@ -432,14 +451,12 @@ class ClaudeSessionWatcher:
                 self._updated_ats.pop(pid, None)  # clean up stale entry
 
         # ── Activity tracking ──
-        # Two independent signals:
-        # 1. mtime change   → file was touched (status transition, etc.)
-        # 2. updatedAt bump → granular activity during a busy session
-        #    (model streaming tokens, calling tools, …)
-        # If neither fires for a while, the gap grows and the state
-        # machine naturally degrades: running → intermittent → thinking.
-        if latest_mtime > self._last_mtime:
-            self._last_mtime = latest_mtime
+        # Only busy-session file changes count as activity.  Idle session
+        # files (or files from stale sessions) should NOT refresh the
+        # activity timer — otherwise a lingering idle session that writes
+        # frequently keeps the pet in "running" mode forever.
+        if latest_busy_mtime > self._last_mtime:
+            self._last_mtime = latest_busy_mtime
             self._last_activity_monotonic = time.monotonic()
 
         # ── Invalidate cache when the on-disk state changes ──

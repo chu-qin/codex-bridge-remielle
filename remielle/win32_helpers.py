@@ -136,6 +136,17 @@ if sys.platform == "win32":
         except Exception:
             return None
 
+    def _get_cursor_pos() -> tuple[int, int] | None:
+        """Return ``(x, y)`` of the cursor in screen coordinates.
+
+        Used by the tray icon to position the right-click menu at the
+        cursor rather than at a stale event position.
+        """
+        pt = _w32.POINT()
+        if _ctypes.windll.user32.GetCursorPos(_ctypes.byref(pt)):
+            return (pt.x, pt.y)
+        return None
+
     # ── Native Windows popup menu (independent of tkinter's window system) ──
     # tk_popup on an overrideredirect + transparent-color window causes
     # persistent z-order flicker that cannot be fully resolved from Python.
@@ -149,7 +160,9 @@ if sys.platform == "win32":
     _MF_CHECKED = 0x00000008
     _TPM_RETURNCMD = 0x00000100
     _TPM_NONOTIFY = 0x00000080
-    _TPM_RIGHTBUTTON = 0x00000002
+    _TPM_RIGHTBUTTON = 0x00000002  # (no longer used — kept for reference)
+    _TPM_BOTTOMALIGN = 0x00000020
+    _WM_NULL = 0x0000
 
     _user32 = _ctypes.windll.user32
     _user32.CreatePopupMenu.restype = _w32.HMENU
@@ -161,8 +174,12 @@ if sys.platform == "win32":
         _w32.HMENU, _w32.UINT, _ctypes.c_int, _ctypes.c_int,
         _ctypes.c_int, _w32.HWND, _w32.LPVOID,
     ]
-    _user32.TrackPopupMenu.restype = _w32.BOOL
-    _user32.GetForegroundWindow.restype = _w32.HWND  # fallback when _hwnd == 0
+    _user32.TrackPopupMenu.restype = _w32.UINT
+    _user32.GetForegroundWindow.restype = _w32.HWND
+    _user32.SetForegroundWindow.argtypes = [_w32.HWND]
+    _user32.SetForegroundWindow.restype = _w32.BOOL
+    _user32.PostMessageW.argtypes = [_w32.HWND, _w32.UINT, _w32.WPARAM, _w32.LPARAM]
+    _user32.PostMessageW.restype = _w32.BOOL
 
     def _native_create_menu() -> int:
         return _user32.CreatePopupMenu()
@@ -189,14 +206,26 @@ if sys.platform == "win32":
         _user32.AppendMenuW(hmenu, _MF_POPUP, sub_hmenu, text)
 
     def _native_track(hmenu: int, hwnd: int, x: int, y: int) -> int:
-        """Show the popup; return the selected item ID, or 0 if dismissed."""
+        """Show the popup; return the selected item ID, or 0 if dismissed.
+
+        ``TPM_RIGHTBUTTON`` is intentionally omitted — it would let the
+        same right-click that opens the tray menu also select a menu
+        item, causing accidental "exit" selections.
+        """
         if not hwnd:
             hwnd = _user32.GetForegroundWindow() or 0
-        return _user32.TrackPopupMenu(
+        if hwnd:
+            _user32.SetForegroundWindow(hwnd)
+        cmd = _user32.TrackPopupMenu(
             hmenu,
-            _TPM_RETURNCMD | _TPM_NONOTIFY | _TPM_RIGHTBUTTON,
+            _TPM_RETURNCMD | _TPM_NONOTIFY | _TPM_BOTTOMALIGN,
             x, y, 0, hwnd, None,
         )
+        # Standard workaround: post a benign message so the tray menu
+        # correctly dismisses and focus returns to the calling window.
+        if hwnd:
+            _user32.PostMessageW(hwnd, _WM_NULL, 0, 0)
+        return int(cmd)
 
 else:
     # Non-Windows stub — native menus aren't available; fall back gracefully.
@@ -210,6 +239,9 @@ else:
         pass
 
     def _get_virtual_screen_bounds() -> None:
+        return None
+
+    def _get_cursor_pos() -> None:
         return None
 
     def _native_create_menu() -> int:
