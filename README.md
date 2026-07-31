@@ -4,8 +4,6 @@
 
 为了更方便追踪项目进度 ~~摸鱼(bushi)~~ 的任务监控桌宠
 
-<img src=".\assets\gif\连续绘制.gif" style="zoom:50%;" />
-
 然而codex额度蹬完暂时没法验证了
 
 等重置.jpg
