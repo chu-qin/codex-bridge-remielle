@@ -1,6 +1,12 @@
-# 蕾米 Codex 桥
+# 蕾米埃尔 Codex 桌宠
 
-把 Claude Code（Codex）的任务状态同步为桌面上的蕾米桌宠动画。零网络、零 API Key、纯本地运行。
+为了更方便追踪项目进度~~摸鱼~~的任务监控桌宠
+
+然而额度蹬完暂时没法验证了（
+
+暂存一个进度等后续开发拓展罢
+
+<img src="C:\Users\Zhang_Qin\Documents\Codex\2026-07-29\kan\outputs\remilia-codex-bridge\assets\gif\连续绘制.gif" style="zoom:80%;" />
 
 ## 启动
 
