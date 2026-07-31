@@ -1,0 +1,17 @@
+# Runtime
+remilia-bridge.log
+remilia-bridge.pid
+settings.json
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
