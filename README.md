@@ -6,7 +6,7 @@
 
 暂存一个进度等后续开发拓展罢
 
-<img src="C:\Users\Zhang_Qin\Documents\Codex\2026-07-29\kan\outputs\remilia-codex-bridge\assets\gif\连续绘制.gif" style="zoom:80%;" />
+<img src=".\assets\gif\连续绘制.gif" style="zoom:80%;" />
 
 ## 启动
 
