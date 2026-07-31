@@ -32,6 +32,123 @@ if sys.platform == "win32":
             style &= ~_WS_EX_TRANSPARENT
         _ctypes.windll.user32.SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, style)
 
+    class _MARGINS(_ctypes.Structure):
+        _fields_ = [("cxLeftWidth", _ctypes.c_int),
+                    ("cxRightWidth", _ctypes.c_int),
+                    ("cxTopHeight", _ctypes.c_int),
+                    ("cxBottomHeight", _ctypes.c_int)]
+
+    def _win32_remove_window_border(hwnd: int) -> None:
+        """Strip every visual chrome that can cause a border around the window.
+
+        On Windows 10 / 11, ``overrideredirect(True)`` alone is not
+        enough — DWM can still render a thin frame, shadow, or rounded
+        corners.  We attack the problem from five angles:
+
+        1. Disable non-client rendering (kills the DWM drop-shadow)
+        2. Disable rounded corners (Win 11)
+        3. DWM negative margins (extend glass over entire window)
+        4. Strip extended-style edge flags
+        5. ``SetWindowPos`` with ``SWP_FRAMECHANGED`` to force a
+           non-client-area recompute
+        """
+        # ── 1. Disable non-client rendering (removes the drop-shadow) ──
+        _DWMWA_NCRENDERING_POLICY = 2
+        _DWMNCRP_DISABLED = 1
+        try:
+            policy = _ctypes.c_int(_DWMNCRP_DISABLED)
+            _ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, _DWMWA_NCRENDERING_POLICY,
+                _ctypes.byref(policy), _ctypes.sizeof(policy),
+            )
+        except Exception:
+            pass
+
+        # ── 2. Disable rounded corners (Win 11) ──
+        _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        _DWMWCP_DONOTROUND = 1
+        try:
+            corner = _ctypes.c_int(_DWMWCP_DONOTROUND)
+            _ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE,
+                _ctypes.byref(corner), _ctypes.sizeof(corner),
+            )
+        except Exception:
+            pass
+
+        # ── 3. DWM frame margins ──
+        try:
+            margins = _MARGINS(-1, -1, -1, -1)
+            _ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+                hwnd, _ctypes.byref(margins),
+            )
+        except Exception:
+            pass
+
+        # ── 4. Extended style: strip window edge & friends ──
+        _WS_EX_WINDOWEDGE = 0x00000100      # 3D raised border
+        _WS_EX_DLGMODALFRAME = 0x00000001   # double border (dialog style)
+        _WS_EX_STATICEDGE = 0x00020000        # 3D sunken border
+        _WS_EX_CLIENTEDGE = 0x00000200        # same as above, Win32 variant
+        _GWL_EXSTYLE = -20
+
+        try:
+            ex_style = _ctypes.windll.user32.GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+            ex_style &= ~(_WS_EX_WINDOWEDGE | _WS_EX_DLGMODALFRAME
+                          | _WS_EX_STATICEDGE | _WS_EX_CLIENTEDGE)
+            _ctypes.windll.user32.SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, ex_style)
+        except Exception:
+            pass
+
+        # ── 5. Force a full frame recompute ──
+        _SWP_NOMOVE = 0x0002
+        _SWP_NOSIZE = 0x0001
+        _SWP_NOZORDER = 0x0004
+        _SWP_FRAMECHANGED = 0x0020
+        _SWP_NOACTIVATE = 0x0010
+        try:
+            _ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOZORDER
+                | _SWP_FRAMECHANGED | _SWP_NOACTIVATE,
+            )
+        except Exception:
+            pass
+
+    def _win32_clip_window_region(hwnd: int, width: int, height: int) -> None:
+        """Set a rectangular window region that exactly clips to ``(width, height)``.
+
+        This is the nuclear option — it tells GDI to ignore everything
+        outside the rectangle, so even if DWM renders a shadow or border,
+        it is physically clipped away.
+        """
+        try:
+            rgn = _ctypes.windll.gdi32.CreateRectRgn(0, 0, width, height)
+            _ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+            # rgn ownership transfers to the window — do NOT DeleteObject it
+        except Exception:
+            pass
+
+    def _get_virtual_screen_bounds() -> tuple[int, int, int, int] | None:
+        """Return ``(left, top, right, bottom)`` of the virtual desktop
+        spanning **all** monitors, or ``None`` on failure.
+
+        Uses ``GetSystemMetrics`` because tkinter's ``winfo_screenwidth`` /
+        ``winfo_screenheight`` only cover the primary monitor.
+        """
+        _SM_XVIRTUALSCREEN = 76
+        _SM_YVIRTUALSCREEN = 77
+        _SM_CXVIRTUALSCREEN = 78
+        _SM_CYVIRTUALSCREEN = 79
+        try:
+            left = _ctypes.windll.user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+            top = _ctypes.windll.user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+            right = left + _ctypes.windll.user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+            bottom = top + _ctypes.windll.user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+            return (left, top, right, bottom)
+        except Exception:
+            return None
+
     # ── Native Windows popup menu (independent of tkinter's window system) ──
     # tk_popup on an overrideredirect + transparent-color window causes
     # persistent z-order flicker that cannot be fully resolved from Python.
@@ -110,6 +227,15 @@ else:
     def _win32_set_clickthrough(hwnd: int, enabled: bool) -> None:
         pass
 
+    def _win32_remove_window_border(hwnd: int) -> None:
+        pass
+
+    def _win32_clip_window_region(hwnd: int, width: int, height: int) -> None:
+        pass
+
+    def _get_virtual_screen_bounds() -> None:
+        return None
+
     def _native_create_menu() -> int:
         return 0
 
@@ -141,6 +267,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 SETTINGS_PATH = APP_DIR / "settings.json"
 LOG_PATH = APP_DIR / "remilia-bridge.log"
 TRANSPARENT_COLOR = "#010203"
+_TRANSPARENT_RGB = (1, 2, 3)  # (R, G, B) for pixel-level colorkey fill
 TERMINAL_EVENT_TYPES = {
     "task_complete",
     "task_failed",
@@ -155,6 +282,7 @@ _DEFAULT_CONFIG: dict = {
     "coordinate_file": "assets/坐标配置.json",
     "codex_sessions_dir": "%USERPROFILE%/.codex/sessions",
     "codex_global_state_path": "%USERPROFILE%/.codex/.codex-global-state.json",
+    "claude_sessions_dir": "%USERPROFILE%/.claude/sessions",
     "actions": {
         "startup": "期待.gif",
         "idle": "待机.gif",
@@ -511,6 +639,181 @@ class CodexUnreadWatcher:
         return set(self.unread_thread_ids)
 
 
+class ClaudeSessionWatcher:
+    """Monitors ``~/.claude/sessions/*.json`` for the ``status`` field.
+
+    Claude Code writes a per-process session JSON file that includes a
+    ``status`` key.  When the model is actively processing a turn,
+    ``status`` is ``"busy"``; otherwise it is ``"idle"`` (or absent).
+
+    The watcher tracks **status transitions** across polls so that a
+    ``busy → idle`` change is surfaced as a ``task_complete`` event,
+    which feeds into the same ``pending_reviews → review`` pipeline
+    used by Codex completions.
+
+    It also validates that the owning PID is still alive, so a stale
+    session file from a crash does not keep the pet in "busy" mode.
+    """
+
+    def __init__(self, sessions_dir: Path) -> None:
+        self.sessions_dir = sessions_dir
+        self._last_mtime: float = 0.0
+        self._last_activity_monotonic: float = 0.0
+        self._cached_busy: bool = False
+        self._cached_pid: int = 0
+        self._cache_mtime: float = 0.0  # wall-clock mtime used for cache-busting
+        self._next_scan: float = 0.0    # monotonic time of next permitted scan
+        # Track sessions that were "busy" last poll so we can detect
+        # transitions:  busy → idle  =  task completed.
+        self._busy_sessions: dict[int, dict] = {}  # pid → {sessionId, name, ...}
+        self._completions: list[dict] = []          # pending completion events
+
+    @property
+    def is_busy(self) -> bool:
+        """Return the cached busy state (updated by ``poll()``)."""
+        return self._cached_busy
+
+    def poll(self) -> tuple[bool, float, list[dict]]:
+        """Return ``(is_busy, last_activity_monotonic, completions)``.
+
+        *is_busy* is ``True`` when at least one Claude Code session has
+        ``status == "busy"`` **and** its PID is still alive.
+
+        *last_activity_monotonic* is a ``time.monotonic()`` snapshot taken
+        the first time a session file's mtime changed.
+
+        *completions* is a list of ``task_complete``-style events (each
+        has ``type``, ``thread_id``, ``source``) for any session that
+        transitioned from ``busy`` to ``idle`` since the last poll.
+        The list is drained on each call.
+        """
+        if not self.sessions_dir.exists():
+            self._cached_busy = False
+            self._busy_sessions.clear()
+            self._completions.clear()
+            return False, 0.0, []
+
+        # Throttle directory scans to 1 Hz — session files don't change
+        # faster than that, and we don't need sub-second responsiveness
+        # for Claude Code status changes.
+        now_mono = time.monotonic()
+        if now_mono < self._next_scan:
+            # Return cached state; drain any pending completions
+            comps = self._completions
+            self._completions = []
+            return self._cached_busy, self._last_activity_monotonic, comps
+        self._next_scan = now_mono + 1.0
+
+        busy = False
+        latest_mtime = 0.0
+        busy_pid = 0
+        current_busy_pids: set[int] = set()
+
+        try:
+            for path in self.sessions_dir.glob("*.json"):
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                pid = data.get("pid", 0)
+                sid = data.get("sessionId", "")
+                name = data.get("name", "")
+                if data.get("status") == "busy":
+                    if pid and _pid_is_alive(pid):
+                        busy = True
+                        busy_pid = pid
+                        current_busy_pids.add(pid)
+                        # Track session info so we can emit a rich
+                        # completion event when it transitions to idle.
+                        if pid not in self._busy_sessions:
+                            self._busy_sessions[pid] = {
+                                "sessionId": sid,
+                                "name": name,
+                            }
+        except OSError:
+            pass
+
+        # ── Detect busy → idle transitions ──
+        for pid, info in list(self._busy_sessions.items()):
+            if pid not in current_busy_pids:
+                # This session was busy last poll but is no longer busy
+                # (either status changed to "idle" or the file was deleted).
+                self._completions.append({
+                    "type": "task_complete",
+                    "thread_id": info["sessionId"],
+                    "source": "claude",
+                    "session_name": info.get("name", ""),
+                })
+                LOGGER.info(
+                    "claude session: task complete pid=%d session=%s name=%s",
+                    pid, info["sessionId"], info.get("name", ""),
+                )
+                del self._busy_sessions[pid]
+
+        # ── When the newest mtime advances, snap a monotonic timestamp ──
+        if latest_mtime > self._last_mtime:
+            self._last_mtime = latest_mtime
+            self._last_activity_monotonic = time.monotonic()
+
+        # ── Keep activity timestamp fresh while Claude Code is busy ──
+        # Claude Code's session JSON mtime only changes on status
+        # transitions (idle→busy, busy→idle).  During a long busy
+        # period the file is NOT rewritten, so the mtime-based
+        # activity tracker would otherwise stall and the pet would
+        # get stuck in "thinking" after thinking_timeout_seconds.
+        # Bumping the timestamp on every scan while busy keeps the
+        # gap small → the state machine shows "running".
+        if busy:
+            self._last_activity_monotonic = time.monotonic()
+
+        # ── Invalidate cache when the on-disk state changes ──
+        if latest_mtime != self._cache_mtime or busy_pid != self._cached_pid:
+            self._cache_mtime = latest_mtime
+            self._cached_busy = busy
+            self._cached_pid = busy_pid
+            if busy:
+                LOGGER.info("claude session: busy pid=%d", busy_pid)
+
+        comps = self._completions
+        self._completions = []
+        return self._cached_busy, self._last_activity_monotonic, comps
+
+
+def _prepare_colorkey_frame(
+    frame: Image.Image,
+    transparent_rgb: tuple[int, int, int] = _TRANSPARENT_RGB,
+    alpha_threshold: int = 96,
+) -> Image.Image:
+    """Convert an RGBA image to RGB, eliminating semi-transparent pixels.
+
+    Tkinter's ``-transparentcolor`` uses ``LWA_COLORKEY`` — binary
+    transparency.  Semi-transparent anti-aliased edges (alpha between
+    1 and 254) don't match the exact colour key and appear as dark
+    fringes.
+
+    This function thresholds alpha:
+    - ``alpha < threshold`` → exact *transparent_rgb* (will be keyed out)
+    - ``alpha >= threshold`` → fully opaque original colour
+
+    Uses Pillow channel ops instead of per-pixel loops for speed.
+    """
+    rgba = frame.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    # 0 = transparent, 255 = opaque
+    binary_mask = alpha.point(
+        lambda v: 255 if v >= alpha_threshold else 0,
+    )
+    foreground = rgba.convert("RGB")
+    background = Image.new("RGB", rgba.size, transparent_rgb)
+    return Image.composite(foreground, background, binary_mask)
+
+
 class RemiliaWindow:
     def __init__(self, config: dict, on_exit: Callable[[], None]) -> None:
         self.config = config
@@ -528,7 +831,7 @@ class RemiliaWindow:
         }
         self.scale = max(0.4, min(2.5, float(self.settings.get("scale", 1.0))))
         self.current_action: str | None = None
-        self.current_status_text = "等待 Codex 任务"
+        self.current_status_text = "等待 AI 任务"
         self.frames: list[ImageTk.PhotoImage] = []
         self.delays: list[int] = []
         self.frame_index = 0
@@ -540,7 +843,7 @@ class RemiliaWindow:
 
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("蕾米 Codex 助手")
+        self.root.title("蕾米 AI 助手")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", bool(config.get("topmost", True)))
         if sys.platform == "win32":
@@ -554,14 +857,18 @@ class RemiliaWindow:
                 self._hwnd = int(self.root.frame(), 0)
             except Exception:
                 self._hwnd = 0
+            if self._hwnd:
+                _win32_remove_window_border(self._hwnd)
 
         self.canvas = tk.Canvas(
             self.root,
             bg=TRANSPARENT_COLOR,
             highlightthickness=0,
             borderwidth=0,
+            relief="flat",
+            bd=0,
         )
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.image_item = self.canvas.create_image(0, 0, anchor="nw")
 
         self.canvas.bind("<ButtonPress-1>", self._start_drag)
@@ -582,7 +889,7 @@ class RemiliaWindow:
         self.autohide_var = tk.BooleanVar(
             value=display_cfg.get("auto_hide_after_complete", False))
         self.scale_var = tk.DoubleVar(value=self.scale)
-        self.current_status_text = "等待 Codex 任务"
+        self.current_status_text = "等待 AI 任务"
 
         self._compute_layout()
         self._apply_geometry()
@@ -611,30 +918,32 @@ class RemiliaWindow:
         self.base_height = max_y - min_y
 
     def _screen_visible_geom(self, width: int, height: int) -> tuple[int, int]:
-        """Return (x, y) that keeps the window fully on a visible monitor.
+        """Return (x, y) clamped to the **virtual** desktop (all monitors).
 
-        Falls back to a default position near the bottom-right of the
-        primary monitor when the saved position is completely off-screen
-        (e.g. after a monitor unplug or a corrupted settings file).
+        On Windows the clamp uses ``GetSystemMetrics`` to obtain the
+        bounding rectangle of the entire virtual screen, so the window can
+        be placed on any monitor.  On other platforms it falls back to
+        ``winfo_screenwidth/height`` (primary monitor only).
         """
         try:
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
+            virt = _get_virtual_screen_bounds()
+            if virt:
+                v_left, v_top, v_right, v_bottom = virt
+            else:
+                v_left, v_top = 0, 0
+                v_right = self.root.winfo_screenwidth()
+                v_bottom = self.root.winfo_screenheight()
         except Exception:
             return (155, 448)
 
-        # Use saved position, or a sensible default
-        x = int(self.settings.get("x", screen_w - width - 40))
-        y = int(self.settings.get("y", screen_h - height - 80))
+        # Use saved position, or default to bottom-right of the desktop
+        x = int(self.settings.get("x", v_right - width - 40))
+        y = int(self.settings.get("y", v_bottom - height - 80))
 
-        # If the entire window is off-screen, reset to default
-        if x + width < 40 or x > screen_w - 40 or y + height < 40 or y > screen_h - 40:
-            x = screen_w - width - 40
-            y = screen_h - height - 80
-
-        # Final edge clamp: always keep at least 40 px on screen
-        x = max(-width + 40, min(x, screen_w - 40))
-        y = max(-height + 40, min(y, screen_h - 40))
+        # Clamp to the virtual desktop — keep at least 40 px visible so
+        # the user can always grab and drag the window back.
+        x = max(v_left - width + 40, min(x, v_right - 40))
+        y = max(v_top - height + 40, min(y, v_bottom - 40))
         return x, y
 
     def _apply_geometry(self) -> None:
@@ -645,7 +954,9 @@ class RemiliaWindow:
         self.settings["x"] = x
         self.settings["y"] = y
         self.canvas.configure(width=width, height=height)
-        self._save_settings()  # persist corrected position immediately
+        if self._hwnd:
+            _win32_clip_window_region(self._hwnd, width, height)
+        self._save_settings()
 
     def _load_action(self, gif_name: str) -> None:
         path = self.asset_dir / gif_name
@@ -655,7 +966,7 @@ class RemiliaWindow:
             frame_count = getattr(gif, "n_frames", 1)
             for index in range(frame_count):
                 gif.seek(index)
-                frame = gif.convert("RGBA")
+                frame = gif.copy().convert("RGBA")
                 if self.scale != 1.0:
                     frame = frame.resize(
                         (
@@ -664,6 +975,14 @@ class RemiliaWindow:
                         ),
                         Image.Resampling.LANCZOS,
                     )
+                # Must be called *after* resize — Lanczos generates
+                # new semi-transparent pixels at edges that need to
+                # be clamped before Tk's binary colour-key sees them.
+                frame = _prepare_colorkey_frame(
+                    frame,
+                    transparent_rgb=_TRANSPARENT_RGB,
+                    alpha_threshold=96,
+                )
                 frames.append(ImageTk.PhotoImage(frame, master=self.root))
                 delays.append(max(15, int(gif.info.get("duration", 30))))
         self.frames = frames
@@ -707,8 +1026,6 @@ class RemiliaWindow:
         if token != self.animation_token or not self.frames:
             return
         if self._menu_active:
-            # Menu is posted — skip canvas update so the overrideredirect
-            # window doesn't repaint over the popup (eliminates flicker).
             self.root.after(50, lambda: self._render_frame(token))
             return
         offset = self.coordinates.get(self.current_action or "", {})
@@ -724,11 +1041,8 @@ class RemiliaWindow:
             if self.loops_remaining is not None:
                 self.loops_remaining -= 1
                 if self.loops_remaining <= 0:
-                    # Enforce minimum play duration so the animation
-                    # never flashes for less than min_play_ms.
                     elapsed = (time.monotonic() - self._play_started_at) * 1000
                     if elapsed < self._min_play_ms:
-                        # Loop one more time
                         self.loops_remaining = 1
                     else:
                         cb = self._on_end
@@ -754,7 +1068,7 @@ class RemiliaWindow:
         self.animation_token += 1
         self.root.withdraw()
         self.visible = False
-        self.set_status_text("等待 Codex 任务")
+        self.set_status_text("等待 AI 任务")
         LOGGER.info("window hidden")
 
     # ── Menu demo & self-test ────────────────────────────────────
@@ -777,7 +1091,7 @@ class RemiliaWindow:
         def _play_step(idx: int) -> None:
             if idx >= len(sequence):
                 # All done — return to idle
-                self.play(idle_gif, loops=None, status_text="等待 Codex 任务")
+                self.play(idle_gif, loops=None, status_text="等待 AI 任务")
                 return
             gif, text, duration = sequence[idx]
             self.play(gif, loops=None, status_text=text)
@@ -979,14 +1293,18 @@ class RemiliaWindow:
 
     def reset_geometry(self) -> None:
         default_scale = float(self.config.get("default_scale", 0.75))
-        # Compute a sensible on-screen default position
+        # Compute a sensible default position on the virtual desktop
         try:
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
+            virt = _get_virtual_screen_bounds()
+            if virt:
+                v_right, v_bottom = virt[2], virt[3]
+            else:
+                v_right = self.root.winfo_screenwidth()
+                v_bottom = self.root.winfo_screenheight()
             bw = max(1, round(self.base_width * default_scale))
             bh = max(1, round(self.base_height * default_scale))
-            dx = sw - bw - 40
-            dy = sh - bh - 80
+            dx = v_right - bw - 40
+            dy = v_bottom - bh - 80
         except Exception:
             dx, dy = 155, 448
         self.settings = {"x": dx, "y": dy, "scale": default_scale}
@@ -1011,10 +1329,8 @@ class RemiliaWindow:
 
     def _end_drag(self, _event: tk.Event) -> None:
         self.drag_origin = None
-        # Record where the user dropped the window …
         self.settings["x"] = self.root.winfo_x()
         self.settings["y"] = self.root.winfo_y()
-        # … then re-apply so it gets clamped (and saved) safely
         self._apply_geometry()
 
     def _wheel(self, event: tk.Event) -> None:
@@ -1070,6 +1386,14 @@ class BridgeApp:
                 )
             )
         )
+        self.claude_watcher = ClaudeSessionWatcher(
+            expand_path(
+                config.get(
+                    "claude_sessions_dir",
+                    r"%USERPROFILE%\.claude\sessions",
+                )
+            )
+        )
         self.window = RemiliaWindow(config, self.stop)
         self.running = True
         self.demo = demo
@@ -1117,7 +1441,7 @@ class BridgeApp:
             self.window.root.after(6800, lambda: self._transition_to("running_intermittent"))
             self.window.root.after(8800, lambda: self._transition_to("review"))
             self.window.root.after(10800, lambda: self._transition_to("idle"))
-            self.window.root.after(12000, lambda: self._cleanup_demo)
+            self.window.root.after(12000, _cleanup_demo)
 
         def _cleanup_demo():
             display_cfg["persistent"] = saved_persistent
@@ -1137,7 +1461,7 @@ class BridgeApp:
 
     def _go_startup(self) -> None:
         startup_gif = self.config["actions"].get("startup", "期待.gif")
-        tip = "蕾米 Codex 助手已启动 · 等待任务"
+        tip = "蕾米 AI 助手已启动 · 等待任务"
         self.window.play(startup_gif, loops=1, status_text=tip,
                          min_play_ms=int(self.config.get("min_play_ms", 2000)),
                          on_end=self._on_startup_done)
@@ -1155,7 +1479,7 @@ class BridgeApp:
 
     def _go_idle(self) -> None:
         idle_gif = self.config["actions"].get("idle", "待机.gif")
-        tip = "等待 Codex 任务"
+        tip = "等待 AI 任务"
         self.window.play(idle_gif, loops=None, status_text=tip)
         self.window.set_clickthrough(
             self.config.get("display", {}).get("clickthrough_on_idle", False))
@@ -1163,7 +1487,10 @@ class BridgeApp:
 
     def _go_thinking(self) -> None:
         thinking_gif = self.config["actions"].get("thinking", "思考.gif")
-        tip = f"Codex 思考中（{len(self.watcher.active_turns)} 个任务）"
+        codex_active = len(self.watcher.active_turns) > 0
+        tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
+        n = len(self.watcher.active_turns)
+        tip = f"{tool} 思考中（{n} 个任务）" if n else f"{tool} 思考中"
         self.window.play(thinking_gif, loops=None, status_text=tip)
         self.window.set_clickthrough(False)
 
@@ -1178,7 +1505,10 @@ class BridgeApp:
 
     def _go_running(self) -> None:
         running_gif = self.config["actions"].get("running", "连续绘制.gif")
-        tip = f"Codex 工作中（{len(self.watcher.active_turns)} 个任务）"
+        codex_active = len(self.watcher.active_turns) > 0
+        tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
+        n = len(self.watcher.active_turns)
+        tip = f"{tool} 工作中（{n} 个任务）" if n else f"{tool} 工作中"
         self.window.play(running_gif, loops=None, status_text=tip,
                          min_play_ms=int(self.config.get("min_play_ms", 2000)))
         self.window.set_clickthrough(False)
@@ -1186,7 +1516,10 @@ class BridgeApp:
 
     def _go_running_intermittent(self) -> None:
         intermittent_gif = self.config["actions"].get("running_intermittent", "间歇绘制.gif")
-        tip = f"Codex 工作中（{len(self.watcher.active_turns)} 个任务）"
+        codex_active = len(self.watcher.active_turns) > 0
+        tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
+        n = len(self.watcher.active_turns)
+        tip = f"{tool} 工作中（{n} 个任务）" if n else f"{tool} 工作中"
         self.window.play(intermittent_gif, loops=None, status_text=tip)
         self.window.set_clickthrough(False)
 
@@ -1236,11 +1569,26 @@ class BridgeApp:
             before, after, events, last_activity = self.watcher.poll()
             unread = self.unread_watcher.poll()
 
+            # Claude Code session monitoring
+            claude_busy, claude_last_activity, claude_completions = \
+                self.claude_watcher.poll()
+
+            # Feed Codex terminal events into pending_reviews
             for event in events:
                 if event["type"] in TERMINAL_EVENT_TYPES and event["thread_id"]:
                     self.pending_reviews[event["thread_id"]] = {
                         "completed_at": time.monotonic(),
                         "seen_unread": event["thread_id"] in unread,
+                    }
+
+            # Feed Claude Code busy→idle transitions into the same pipeline.
+            # Claude Code has no "unread" concept, so completions always
+            # auto-resolve after settle_seconds (default ~2.5 s).
+            for comp in claude_completions:
+                if comp.get("thread_id"):
+                    self.pending_reviews[comp["thread_id"]] = {
+                        "completed_at": time.monotonic(),
+                        "seen_unread": False,
                     }
 
             self._update_reviews(unread)
@@ -1254,13 +1602,22 @@ class BridgeApp:
             intermittent_timeout = float(thresholds.get("intermittent_timeout_seconds", 3.0))
             now = time.monotonic()
 
-            # Compute gap since last activity
-            gap = now - last_activity if last_activity > 0 else float("inf")
+            # Merge Codex + Claude Code into a unified active/idle signal.
+            # Codex provides per-turn activity via its JSONL stream; Claude
+            # Code provides a binary busy/idle via its session JSON file.
+            codex_active = after > 0
+            effective_active = codex_active or claude_busy
+            effective_last_activity = last_activity
+            if claude_last_activity > effective_last_activity:
+                effective_last_activity = claude_last_activity
+
+            # Compute gap since last activity (from either tool)
+            gap = (now - effective_last_activity
+                   if effective_last_activity > 0 else float("inf"))
 
             # Determine target mode
-            if after > 0:
-                # Has active tasks
-                if last_activity == 0.0 or gap > think_timeout:
+            if effective_active:
+                if effective_last_activity == 0.0 or gap > think_timeout:
                     target = "thinking"
                 elif gap > intermittent_timeout:
                     target = "running_intermittent"
@@ -1291,27 +1648,39 @@ class BridgeApp:
                 self._transition_to(target)
             else:
                 # Same mode — refresh status text
-                self._refresh_status(target, after, unread)
+                self._refresh_status(target, after, unread,
+                                     claude_busy=claude_busy)
 
         except Exception:
             LOGGER.exception("poll failed")
         self._schedule_poll()
 
-    def _refresh_status(self, mode: str, active_count: int, unread: set[str]) -> None:
-        """Update status text and tray tooltip without changing animation."""
-        if mode == "running" or mode == "running_intermittent":
-            tip = f"Codex 工作中（{active_count} 个任务）"
+    def _refresh_status(self, mode: str, active_count: int, unread: set[str],
+                        *, claude_busy: bool = False) -> None:
+        """Update status text without changing animation."""
+        tool = self._tool_label(active_count > 0, claude_busy)
+        if mode in ("running", "running_intermittent"):
+            tip = f"{tool} 工作中（{active_count} 个任务）" if active_count else f"{tool} 工作中"
         elif mode == "thinking":
-            tip = f"Codex 思考中（{active_count} 个任务）"
+            tip = f"{tool} 思考中（{active_count} 个任务）" if active_count else f"{tool} 思考中"
         elif mode == "review":
             tip = f"任务完成，等待查看（{len(self.pending_reviews)}）"
         elif mode == "ready":
             tip = f"有未读消息（{len(unread)} 个会话）"
         elif mode == "idle":
-            tip = "等待 Codex 任务"
+            tip = "等待 AI 任务"
         else:
             return
         self.window.set_status_text(tip)
+
+    @staticmethod
+    def _tool_label(codex_active: bool, claude_busy: bool) -> str:
+        """Return a human-readable label for which AI tool(s) are active."""
+        if codex_active and claude_busy:
+            return "Codex + Claude Code"
+        if claude_busy:
+            return "Claude Code"
+        return "Codex"
 
 
     def _schedule_poll(self) -> None:
