@@ -1,88 +1,105 @@
-# 蕾米 AI 助手 (Remielle Codex Bridge)
+# 蕾米 AI 助手（Remielle Codex Bridge）
 
-> 桌面 AI 任务状态监控宠，实时反映 Codex / Claude Code 的工作状态
+> 一个只在 AI 执行任务时出现的 Windows 桌宠
 
 为了更方便追踪项目进度 ~~摸鱼(bushi)~~ 的任务监控桌宠
 
-然而codex额度蹬完暂时没法验证了
+然而codex额度蹬完暂时没法验证（
 
-等重置.jpg
+~~等重置.jpg~~嘻嘻重置了爷的额度回来了
 
-<img src=".\assets\gif\期待.gif" style="zoom:50%;" />
+![期待](assets/gif/期待.gif)
 
 ## 功能
 
-- **实时状态监控**：根据 AI 工具的活动自动切换动画
-- **系统托盘驻留**：关闭窗口后托盘保留，左键唤回，右键菜单
-- **拖拽 + 缩放**：鼠标拖拽移动位置，滚轮调整大小
-- **开机自启**：菜单一键安装/卸载
+- 工作、思考、完成、失败和取消状态动画
+- 桌宠旁用半透明磨砂标签显示状态和本次任务 Token 用量
+- 状态信息可隐藏，可放在上、下、左、右四个方向并自动排版
+- 任务结果会保留到你打开任务，查看后自动回待机或隐藏
+- 支持拖拽、位置记忆和 40%～250% 缩放
+- 支持 Codex Hooks、JSONL 兼容监听和 Claude Code 状态
+- 提供简洁菜单和 Windows 系统托盘
 
-## 状态说明
+## 首次使用
 
-| 动画 | 状态 | 触发条件 |
-|------|------|---------|
-| 待机 | idle | 无任务，常驻显示 |
-| 思考 | thinking | 任务活跃但长时间无输出 |
-| 连续绘制 | running | 任务活跃，持续产出 |
-| 间歇绘制 | running_intermittent | 任务活跃，间歇产出 |
-| 拿笔待机 | ready | 有未读消息等待查看 |
-| 得意 | review | 任务完成待查看 |
-| 期待 | 拖拽中 | 鼠标拖拽窗口时 |
+1. 双击 `启动蕾米Codex助手.vbs`。
+2. 右键桌宠或托盘图标，打开蕾米菜单。
+3. 点击“启用官方 Codex Hooks（推荐）”。
+4. 重启 Codex，在 `/hooks` 中检查并信任两个蕾米命令。
 
-<img src=".\assets\gif\思考.gif" style="zoom:50%;" />
+Hooks 尚未安装或未被信任时，桌宠会继续使用 JSONL 兼容模式。官方 Hook 机制说明见 [Codex Hooks 文档](https://developers.openai.com/codex/hooks)。
 
-## 用法
-
-### 启动
-
-双击 `启动蕾米Codex助手.vbs`
-
-### 托盘图标
+## 操作
 
 | 操作 | 行为 |
-|------|------|
-| 左键图标 | 显示 / 隐藏桌宠 |
-| 右键图标 | 弹出菜单（状态信息、显示/隐藏、自检、大小、退出等） |
+|---|---|
+| 左键拖拽 | 移动桌宠 |
+| 滚轮 | 连续调整大小 |
+| 双击桌宠 | 确认当前任务结果已查看 |
+| 右键桌宠 | 打开菜单 |
+| 左键托盘图标 | 显示/隐藏桌宠 |
+| 右键托盘图标 | 打开菜单 |
 
-### 窗口操作
+默认只在任务期间显示。常驻、查看后隐藏、桌宠大小可在一级菜单调整；状态与 Token 的显示和位置在“更多设置”中调整。
 
-| 操作 | 行为 |
-|------|------|
-| 右键桌宠 | 弹出菜单 |
-| 左键拖拽 | 移动位置 |
-| 滚轮 | 缩放大小 |
-| 关闭按钮 | 隐藏到托盘（不退出） |
+## 动画状态
 
-## 开发
+| 状态 | 默认动画 |
+|---|---|
+| 工作 | 连续绘制 |
+| 间歇输出 | 间歇绘制 |
+| 长时间无输出 | 思考 |
+| 成功完成 | 得意 |
+| 执行失败 | 思考并显示失败提示 |
+| 取消/中止 | 拿笔待机并显示取消提示 |
+| 拖拽 | 期待 |
 
-### 运行自检
+任务结果优先根据 Codex 蓝点的“未读 → 已读”切换退出。若未读记录没有及时更新，只有一个待查看结果时会在你重新进入 Codex 后确认；任务原本就在前台时会经过短暂稳定期后回到待机。多任务情况下不会猜测查看对象，仍可双击桌宠手动确认。
 
-```bash
-python remielle_codex_bridge.pyw --self-test
-```
+## 运行环境
 
-### 运行单元测试
-
-```bash
-python -m unittest remielle.tests.test_state_machine -v
-```
-
-### 演示模式
-
-```bash
-python remielle_codex_bridge.pyw --demo
-```
-
-## 依赖
-
+- Windows 10/11
 - Python 3.12+
-- Pillow（`pip install Pillow`）
+- Pillow
 
-## 配置
+安装依赖：
 
-首次运行自动生成 `config.json`，可自定义：
+```powershell
+python -m pip install -r requirements.txt
+```
 
-- `activity_thresholds`：状态切换的时间阈值
-- `poll_interval_ms`：轮询间隔
-- `recent_session_days`：扫描最近 N 天的 session
-- `default_scale`：默认缩放
+启动器会优先使用 `CODEX_PYTHON`，其次使用 Codex 自带运行时，最后搜索系统 `pythonw.exe`。依赖缺失时会显示错误窗口，不再静默退出。
+
+## 开发与验证
+
+```powershell
+python remielle_codex_bridge.pyw --self-test
+python remielle_codex_bridge.pyw --demo
+python -m unittest discover -s remielle/tests -v
+```
+
+当前测试覆盖状态优先级、Hook 队列、Hook 安装合并、未读文件半写保护、新会话发现、前台查看确认、性能节流和失败分类。
+
+## 构建独立版本
+
+```powershell
+python -m pip install -r requirements-dev.txt
+.\构建发布版.ps1
+```
+
+输出位于 `dist/RemielleCodexBridge/`，其中包含桌宠主程序和独立的 `RemielleHook.exe`。
+
+## 配置和运行数据
+
+- 项目配置：`config.json`
+- 动画坐标：`assets/坐标配置.json`
+- 用户设置、日志、PID 和 Hook 事件：`%LOCALAPPDATA%\RemielleCodexBridge\`
+- Codex Hook 配置：`%CODEX_HOME%\hooks.json`，未设置 `CODEX_HOME` 时为 `%USERPROFILE%\.codex\hooks.json`
+
+运行数据不再写入发布目录。Hook 安装和卸载只增删带有蕾米标记的命令，不会覆盖已有 Hook。
+
+## 兼容性说明
+
+官方 Hooks 是主状态源。JSONL 和 Codex 桌面端未读字段属于兼容适配层；未读字段异常时会使用按需启用的 Codex 前台检测作单任务兜底，多任务无法确定具体查看对象时可双击桌宠手动确认。
+
+本项目不调用 OpenAI API，不需要 API Key，也不会上传会话内容。Hook 只记录会话 ID、任务 ID、工作目录和时间戳。
