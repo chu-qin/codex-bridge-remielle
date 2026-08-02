@@ -86,6 +86,7 @@ python -m pip install -r requirements.txt
 本项目不调用 OpenAI API，不需要 API Key，也不会上传会话内容。Hook 只记录会话 ID、任务 ID、工作目录和时间戳。
 
 > ~~后续碎碎念~~
+
 感谢米忽悠网页活动开源
 ai真是太好用了你知道吗.jpg
 后续完善功能考虑打包个程序发布
