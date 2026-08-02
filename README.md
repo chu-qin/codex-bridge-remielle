@@ -1,12 +1,12 @@
-# 蕾米 AI 助手（Remielle Codex Bridge）
+# 蕾米 AI 助手
 
 > 一只用于 AI 执行任务的 Windows 桌宠
 
 为了更方便追踪项目进度 ~~摸鱼(bushi)~~ 的任务监控桌宠
 
-然而codex额度蹬完暂时没法验证（
+~~然而codex额度蹬完暂时没法验证（，~~~~等重置.jpg~~
 
-~~等重置.jpg~~嘻嘻重置了爷的额度回来了
+嘻嘻重置了爷的额度回来了
 
 ![期待](assets/gif/期待.gif)
 
@@ -84,3 +84,9 @@ python -m pip install -r requirements.txt
 官方 Hooks 是主状态源。JSONL 和 Codex 桌面端未读字段属于兼容适配层；未读字段异常时会使用按需启用的 Codex 前台检测作单任务兜底，多任务无法确定具体查看对象时可双击桌宠手动确认。
 
 本项目不调用 OpenAI API，不需要 API Key，也不会上传会话内容。Hook 只记录会话 ID、任务 ID、工作目录和时间戳。
+
+> ~~后续碎碎念~~
+感谢米忽悠网页活动开源
+ai真是太好用了你知道吗.jpg
+后续完善功能考虑打包个程序发布
+以上
