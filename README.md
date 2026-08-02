@@ -88,6 +88,9 @@ python -m pip install -r requirements.txt
 > ~~后续碎碎念~~
 
 感谢米忽悠网页活动开源
+
 ai真是太好用了你知道吗.jpg
+
 后续完善功能考虑打包个程序发布
+
 以上
