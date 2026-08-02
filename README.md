@@ -1,6 +1,6 @@
 # 蕾米 AI 助手（Remielle Codex Bridge）
 
-> 一个只在 AI 执行任务时出现的 Windows 桌宠
+> 一只用于 AI 执行任务的 Windows 桌宠
 
 为了更方便追踪项目进度 ~~摸鱼(bushi)~~ 的任务监控桌宠
 
@@ -69,25 +69,6 @@ python -m pip install -r requirements.txt
 ```
 
 启动器会优先使用 `CODEX_PYTHON`，其次使用 Codex 自带运行时，最后搜索系统 `pythonw.exe`。依赖缺失时会显示错误窗口，不再静默退出。
-
-## 开发与验证
-
-```powershell
-python remielle_codex_bridge.pyw --self-test
-python remielle_codex_bridge.pyw --demo
-python -m unittest discover -s remielle/tests -v
-```
-
-当前测试覆盖状态优先级、Hook 队列、Hook 安装合并、未读文件半写保护、新会话发现、前台查看确认、性能节流和失败分类。
-
-## 构建独立版本
-
-```powershell
-python -m pip install -r requirements-dev.txt
-.\构建发布版.ps1
-```
-
-输出位于 `dist/RemielleCodexBridge/`，其中包含桌宠主程序和独立的 `RemielleHook.exe`。
 
 ## 配置和运行数据
 
