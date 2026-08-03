@@ -4,9 +4,64 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from .config import expand_path, load_json, LOGGER, TERMINAL_EVENT_TYPES, _pid_is_alive
+from .config import expand_path, LOGGER, TERMINAL_EVENT_TYPES, _pid_is_alive
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Small, content-free snapshot of Codex token counters."""
+
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "TokenUsage":
+        if not isinstance(value, dict):
+            return cls()
+
+        def number(key: str, fallback: str | None = None) -> int:
+            raw = value.get(key, value.get(fallback, 0) if fallback else 0)
+            try:
+                return max(0, int(raw or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        input_tokens = number("input_tokens")
+        output_tokens = number("output_tokens")
+        total_tokens = number("total_tokens") or input_tokens + output_tokens
+        return cls(
+            input_tokens=input_tokens,
+            cached_input_tokens=number(
+                "cached_input_tokens", "cache_read_input_tokens"
+            ),
+            output_tokens=output_tokens,
+            reasoning_output_tokens=number("reasoning_output_tokens"),
+            total_tokens=total_tokens,
+        )
+
+    def delta_from(self, baseline: "TokenUsage") -> "TokenUsage":
+        values = {
+            name: max(0, getattr(self, name) - getattr(baseline, name))
+            for name in self.__dataclass_fields__
+        }
+        if not values["total_tokens"]:
+            values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+        return TokenUsage(**values)
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            **{
+                name: getattr(self, name) + getattr(other, name)
+                for name in self.__dataclass_fields__
+            }
+        )
+
 
 class CodexSessionWatcher:
     def __init__(
@@ -14,6 +69,7 @@ class CodexSessionWatcher:
         sessions_dir: Path,
         recent_days: int = 2,
         discovery_interval_seconds: float = 2.0,
+        file_cache_ttl_seconds: float = 1.0,
     ) -> None:
         self.sessions_dir = sessions_dir
         self.recent_days = recent_days
@@ -24,18 +80,26 @@ class CodexSessionWatcher:
         self.events: list[dict[str, str]] = []
         self.last_activity_time: float = 0.0
         self._last_discovery = 0.0
+        self._last_inactive_poll = 0.0
         self._initializing = False
         # Cache for _recent_files() — full rglob + stat of the sessions
         # tree is expensive; cache results for 30 s between refreshes.
         self._file_cache: list[Path] | None = None
         self._file_cache_time: float = 0.0
-        self._file_cache_ttl: float = 30.0
+        self._file_cache_ttl: float = max(0.25, file_cache_ttl_seconds)
+        # Codex writes cumulative token snapshots into the session JSONL.
+        # Keep only numeric counters: message text is never retained.
+        self.file_total_usage: dict[Path, TokenUsage] = {}
+        self.current_turn_by_path: dict[Path, str] = {}
+        self.turn_baselines: dict[str, TokenUsage] = {}
+        self.turn_usage: dict[str, TokenUsage] = {}
+        self._turn_order: list[str] = []
 
     def _recent_files(self) -> list[Path]:
         """Return ``.jsonl`` files modified within ``recent_days``.
 
-        Results are cached for ``_file_cache_ttl`` seconds to avoid
-        repeated full-directory scans when the poll fires at 350 ms.
+        Results are briefly cached to avoid repeated full-directory scans
+        while still discovering a newly created Codex task promptly.
         """
         now = time.time()
         if (self._file_cache is not None
@@ -71,6 +135,7 @@ class CodexSessionWatcher:
             self._read_new_bytes(path, from_start=True)
         self._initializing = False
         self._last_discovery = time.monotonic()
+        self._last_inactive_poll = self._last_discovery
         LOGGER.info(
             "watcher initialized: files=%d active_turns=%d",
             len(self.offsets),
@@ -100,6 +165,7 @@ class CodexSessionWatcher:
             and b'"assistant_message"' not in raw
             and b'"tool_use"' not in raw
             and b'"tool_result"' not in raw
+            and b'"token_count"' not in raw
         ):
             return
         try:
@@ -110,6 +176,9 @@ class CodexSessionWatcher:
             return
         payload = event.get("payload") or {}
         event_type = payload.get("type")
+        if event_type == "token_count":
+            self._process_token_count(payload, source_path)
+            return
         turn_id = payload.get("turn_id")
         if not turn_id:
             return
@@ -120,6 +189,12 @@ class CodexSessionWatcher:
 
         if event_type == "task_started":
             self.active_turns.add(turn_id)
+            self.current_turn_by_path[source_path] = turn_id
+            self.turn_baselines[turn_id] = self.file_total_usage.get(
+                source_path, TokenUsage()
+            )
+            self.turn_usage[turn_id] = TokenUsage()
+            self._remember_turn(turn_id)
             if not self._initializing:
                 self.events.append(
                     {
@@ -134,6 +209,8 @@ class CodexSessionWatcher:
                 )
         elif event_type in TERMINAL_EVENT_TYPES:
             self.active_turns.discard(turn_id)
+            if self.current_turn_by_path.get(source_path) == turn_id:
+                self.current_turn_by_path.pop(source_path, None)
             if not self._initializing:
                 self.events.append(
                     {
@@ -151,6 +228,45 @@ class CodexSessionWatcher:
                 )
         # Non-lifecycle events (assistant_message, tool_use, tool_result)
         # update last_activity_time above but do NOT generate lifecycle events
+
+    def _remember_turn(self, turn_id: str) -> None:
+        if turn_id in self._turn_order:
+            self._turn_order.remove(turn_id)
+        self._turn_order.append(turn_id)
+        while len(self._turn_order) > 256:
+            oldest = self._turn_order.pop(0)
+            if oldest in self.active_turns:
+                self._turn_order.append(oldest)
+                break
+            self.turn_baselines.pop(oldest, None)
+            self.turn_usage.pop(oldest, None)
+
+    def _process_token_count(self, payload: dict, source_path: Path) -> None:
+        """Update the current turn from a cumulative Codex token snapshot."""
+        info = payload.get("info") or {}
+        current = TokenUsage.from_mapping(info.get("total_token_usage"))
+        if current.total_tokens <= 0:
+            return
+
+        previous = self.file_total_usage.get(source_path, TokenUsage())
+        # A truncated/replaced session can restart its counters. Treat the new
+        # snapshot as a fresh baseline instead of displaying a negative jump.
+        if current.total_tokens < previous.total_tokens:
+            previous = TokenUsage()
+        self.file_total_usage[source_path] = current
+
+        turn_id = self.current_turn_by_path.get(source_path)
+        if not turn_id:
+            return
+        baseline = self.turn_baselines.get(turn_id, previous)
+        self.turn_usage[turn_id] = current.delta_from(baseline)
+
+    def usage_for_turns(self, turn_ids: set[str]) -> TokenUsage:
+        """Return aggregate usage for active or completed turns."""
+        usage = TokenUsage()
+        for turn_id in turn_ids:
+            usage = usage + self.turn_usage.get(turn_id, TokenUsage())
+        return usage
 
     def _read_new_bytes(self, path: Path, from_start: bool = False) -> None:
         try:
@@ -185,8 +301,24 @@ class CodexSessionWatcher:
                 if path not in self.offsets:
                     self._read_new_bytes(path, from_start=True)
             self._last_discovery = now
+
+        # Active session files retain the normal 500 ms response time.  Old,
+        # inactive files only need a low-frequency compatibility check because
+        # official Hooks announce new turns immediately.  This avoids one
+        # ``stat`` call per historical session on every UI poll.
+        inactive_due = (
+            now - self._last_inactive_poll >= self.discovery_interval_seconds
+        )
+        active_paths = {
+            path
+            for path, turn_id in self.current_turn_by_path.items()
+            if turn_id in self.active_turns
+        }
         for path in tuple(self.offsets):
-            self._read_new_bytes(path)
+            if path in active_paths or inactive_due:
+                self._read_new_bytes(path)
+        if inactive_due:
+            self._last_inactive_poll = now
         events = self.events
         self.events = []
         return before, len(self.active_turns), events, self.last_activity_time
@@ -198,7 +330,7 @@ class CodexUnreadWatcher:
                  stale_hours: float = 4.0) -> None:
         self.state_path = state_path
         self.sessions_dir = sessions_dir
-        self.stale_hours = stale_hours
+        self.stale_hours = max(0.0, stale_hours)
         self.last_mtime_ns = -1
         self.unread_thread_ids: set[str] = set()
 
@@ -238,8 +370,13 @@ class CodexUnreadWatcher:
             return set(self.unread_thread_ids)
         if mtime_ns == self.last_mtime_ns:
             return set(self.unread_thread_ids)
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # Codex can replace this file while we are polling it.  A partial
+            # read must never turn a valid unread set into an empty set.
+            return set(self.unread_thread_ids)
         self.last_mtime_ns = mtime_ns
-        state = load_json(self.state_path)
         atom_state = state.get("electron-persisted-atom-state") or {}
         unread_by_host = atom_state.get("unread-thread-ids-by-host-v1") or {}
         local = unread_by_host.get("local") or []
@@ -252,17 +389,18 @@ class CodexUnreadWatcher:
         #
         # Always intersect — even when *every* thread is stale (recent
         # is empty), the intersection correctly yields zero unread IDs.
-        recent = self._recent_thread_ids()
-        validated = new_ids & recent
-        dropped = new_ids - recent
-        if dropped:
-            LOGGER.info(
-                "unread watcher: %d raw → %d validated "
-                "(dropped %d threads inactive >%.0fh)",
-                len(new_ids), len(validated), len(dropped),
-                self.stale_hours,
-            )
-        new_ids = validated
+        if self.stale_hours > 0:
+            recent = self._recent_thread_ids()
+            validated = new_ids & recent
+            dropped = new_ids - recent
+            if dropped:
+                LOGGER.info(
+                    "unread watcher: %d raw → %d validated "
+                    "(dropped %d threads inactive >%.0fh)",
+                    len(new_ids), len(validated), len(dropped),
+                    self.stale_hours,
+                )
+            new_ids = validated
 
         if new_ids != self.unread_thread_ids:
             LOGGER.info(

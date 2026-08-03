@@ -12,6 +12,8 @@ from .config import (APP_DIR, CONFIG_PATH, _DEFAULT_COORDINATES,
                      TERMINAL_EVENT_TYPES, LOGGER,
                      expand_path, load_json)
 from .watchers import CodexSessionWatcher, CodexUnreadWatcher, ClaudeSessionWatcher
+from .hooks import HookEventWatcher, hooks_installed
+from .win32_helpers import _is_codex_foreground
 from .window import RemielleWindow
 
 class BridgeApp:
@@ -22,26 +24,47 @@ class BridgeApp:
             sessions_dir=sessions_dir,
             recent_days=int(config["recent_session_days"]),
             discovery_interval_seconds=float(config["discovery_interval_seconds"]),
+            file_cache_ttl_seconds=float(config["session_file_cache_ttl_seconds"]),
         )
         self.unread_watcher = CodexUnreadWatcher(
             expand_path(config["codex_global_state_path"]),
             sessions_dir=sessions_dir,
+            stale_hours=float(config["unread_stale_hours"]),
         )
         self.claude_watcher = ClaudeSessionWatcher(
             expand_path(config["claude_sessions_dir"]),
             scan_interval_seconds=float(config["claude_scan_interval_seconds"]),
         )
-        self.window = RemielleWindow(config, self.stop)
+        self.hook_watcher = HookEventWatcher(
+            max_age_hours=float(config["hook_queue_max_age_hours"]),
+        )
+        self.hook_active_turns: set[str] = set()
+        self.hook_finished_turns: set[str] = set()
+        self.window = RemielleWindow(
+            config,
+            self.stop,
+            on_acknowledge=self.acknowledge_reviews,
+        )
         self.running = True
         self.demo = demo
-        self.pending_reviews: dict[str, dict[str, float | bool]] = {}
+        self.pending_reviews: dict[str, dict[str, float | bool | str]] = {}
         self.display_mode = "hidden"
         self._started_at = 0.0  # set in start() for grace-period logic
+        self._codex_was_foreground = False
+        self._hooks_enabled_cache = hooks_installed()
+        self._hooks_status_checked_at = time.monotonic()
 
     def start(self) -> None:
         self._started_at = time.monotonic()
         if self.demo:
             self._demo_all()
+            self.window.root.after(
+                250,
+                lambda: self.window.show_menu_at(
+                    self.window.root.winfo_screenwidth() - 24, 80,
+                    source="tray",
+                ),
+            )
         else:
             active = self.watcher.initialize()
             if active:
@@ -69,16 +92,42 @@ class BridgeApp:
         saved_persistent = display_cfg["persistent"]
         display_cfg["persistent"] = True  # temporarily on for the demo
 
+        def _demo_step(mode: str, tokens: int = 0) -> None:
+            self._transition_to(mode)
+            indicator_status = {
+                "running": "工作中",
+                "running_intermittent": "间歇工作中",
+                "thinking": "思考中",
+                "review": "完成",
+            }.get(mode, self._MODE_LABELS.get(mode, mode))
+            self.window.set_status_info({
+                "mode": self._MODE_LABELS.get(mode, mode),
+                "indicator_status": indicator_status,
+                "active": "1" if mode in {
+                    "thinking", "running", "running_intermittent"
+                } else "",
+                "unread": "",
+                "claude": "空闲",
+                "reviews": "1" if mode == "review" else "",
+                "hooks": "演示",
+                "token_total": str(tokens),
+                "token_input": str(round(tokens * 0.72)),
+                "token_cached": str(round(tokens * 0.18)),
+                "token_output": str(round(tokens * 0.28)),
+            })
+
         def _seq():
-            self._transition_to("startup")
-            self.window.root.after(1200, lambda: self._transition_to("idle"))
-            self.window.root.after(2400, lambda: self._transition_to("ready"))
-            self.window.root.after(3600, lambda: self._transition_to("thinking"))
-            self.window.root.after(4800, lambda: self._transition_to("running"))
-            self.window.root.after(6800, lambda: self._transition_to("running_intermittent"))
-            self.window.root.after(8800, lambda: self._transition_to("review"))
-            self.window.root.after(10800, lambda: self._transition_to("idle"))
-            self.window.root.after(12000, _cleanup_demo)
+            _demo_step("startup")
+            self.window.root.after(1500, lambda: _demo_step("idle"))
+            self.window.root.after(3000, lambda: _demo_step("ready", 320))
+            self.window.root.after(5000, lambda: _demo_step("thinking", 860))
+            self.window.root.after(8000, lambda: _demo_step("running", 1840))
+            self.window.root.after(
+                16000, lambda: _demo_step("running_intermittent", 4720)
+            )
+            self.window.root.after(24000, lambda: _demo_step("review", 6380))
+            self.window.root.after(30000, lambda: _demo_step("idle"))
+            self.window.root.after(32000, _cleanup_demo)
 
         def _cleanup_demo():
             display_cfg["persistent"] = saved_persistent
@@ -141,9 +190,9 @@ class BridgeApp:
 
     def _go_thinking(self) -> None:
         thinking_gif = self.config["actions"]["thinking"]
-        codex_active = len(self.watcher.active_turns) > 0
+        n = self._codex_active_count()
+        codex_active = n > 0
         tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
-        n = len(self.watcher.active_turns)
         tip = f"{tool} 思考中（{n} 个任务）" if n else f"{tool} 思考中"
         self.window.play(thinking_gif, loops=None, status_text=tip)
         self.window.set_clickthrough(False)
@@ -159,9 +208,9 @@ class BridgeApp:
 
     def _go_running(self) -> None:
         running_gif = self.config["actions"]["running"]
-        codex_active = len(self.watcher.active_turns) > 0
+        n = self._codex_active_count()
+        codex_active = n > 0
         tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
-        n = len(self.watcher.active_turns)
         tip = f"{tool} 工作中（{n} 个任务）" if n else f"{tool} 工作中"
         self.window.play(running_gif, loops=None, status_text=tip,
                          min_play_ms=int(self.config["min_play_ms"]))
@@ -170,18 +219,28 @@ class BridgeApp:
 
     def _go_running_intermittent(self) -> None:
         intermittent_gif = self.config["actions"]["running_intermittent"]
-        codex_active = len(self.watcher.active_turns) > 0
+        n = self._codex_active_count()
+        codex_active = n > 0
         tool = self._tool_label(codex_active, self.claude_watcher.is_busy)
-        n = len(self.watcher.active_turns)
         tip = f"{tool} 工作中（{n} 个任务）" if n else f"{tool} 工作中"
         self.window.play(intermittent_gif, loops=None, status_text=tip)
         self.window.set_clickthrough(False)
 
 
     def _go_review(self) -> None:
-        tip = f"任务完成，等待查看（{len(self.pending_reviews)}）"
+        outcomes = {str(item.get("outcome") or "complete")
+                    for item in self.pending_reviews.values()}
+        if "failed" in outcomes:
+            action = self.config["actions"]["failed"]
+            tip = f"任务执行失败，等待确认（{len(self.pending_reviews)}）"
+        elif outcomes == {"cancelled"}:
+            action = self.config["actions"]["cancelled"]
+            tip = f"任务已取消，等待确认（{len(self.pending_reviews)}）"
+        else:
+            action = self.config["actions"]["complete"]
+            tip = f"任务完成，等待查看（{len(self.pending_reviews)}）"
         self.window.play(
-            self.config["actions"]["complete"],
+            action,
             loops=None, status_text=tip,
             min_play_ms=int(self.config["min_play_ms"]),
         )
@@ -191,6 +250,10 @@ class BridgeApp:
     def _go_hidden(self) -> None:
         self.window.hide()
 
+    def _codex_active_count(self) -> int:
+        fallback = self.watcher.active_turns - self.hook_finished_turns
+        return len(fallback | self.hook_active_turns)
+
 
     def _unread_is_meaningful(self, now: float) -> bool:
         """Ignore unread counts during a short grace period after startup,
@@ -199,22 +262,154 @@ class BridgeApp:
         grace = float(self.config["startup_grace_seconds"])
         return (now - self._started_at) >= grace
 
-    def _update_reviews(self, unread: set[str]) -> None:
-        now = time.monotonic()
+    def _update_reviews(
+        self,
+        unread: set[str],
+        *,
+        codex_foreground: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Clear results after a read transition or a guarded focus fallback.
+
+        The unread-ID transition remains the precise, preferred signal.  Some
+        Codex Desktop builds retain stale unread IDs or never mark the task
+        that was already open when it completed.  For those cases we accept a
+        stable foreground transition only when exactly one Codex result is
+        pending.  The extra Win32 query is performed only in review mode.
+        """
+        now = time.monotonic() if now is None else now
         settle_seconds = max(
-            1.8,
-            float(self.config["unread_settle_ms"]) / 1000,
+            0.0,
+            float(getattr(self, "config", {}).get("unread_settle_ms", 2500))
+            / 1000.0,
         )
-        completed: list[str] = []
+        focus_delay = max(
+            0.0,
+            float(
+                getattr(self, "config", {}).get(
+                    "review_focus_ack_delay_ms", 900
+                )
+            ) / 1000.0,
+        )
+        focus_entered = (
+            codex_foreground
+            and not bool(getattr(self, "_codex_was_foreground", False))
+        )
+        self._codex_was_foreground = codex_foreground
+        allow_focus_fallback = (
+            len(self.pending_reviews) == 1
+            and str(next(iter(self.pending_reviews.values())).get("source") or "codex")
+            == "codex"
+        )
+        completed: list[tuple[str, str]] = []
         for thread_id, state in self.pending_reviews.items():
-            if thread_id in unread:
+            completed_at = float(state.get("completed_at") or now)
+            elapsed = max(0.0, now - completed_at)
+            is_unread = thread_id in unread
+            if is_unread:
                 state["seen_unread"] = True
+
+            # Do not treat the completion poll itself as a later focus event.
+            # A genuine focus transition must occur after the result exists.
+            if (
+                allow_focus_fallback
+                and focus_entered
+                and elapsed >= 0.1
+            ):
+                state["codex_focus_at"] = now
+
+            if not is_unread and bool(state.get("seen_unread")):
+                completed.append((thread_id, "unread-to-read"))
                 continue
-            if bool(state["seen_unread"]) or now - float(state["completed_at"]) >= settle_seconds:
-                completed.append(thread_id)
-        for thread_id in completed:
+
+            # If the task was already visible when it completed, Codex may
+            # never create a blue dot.  Only accept that inference when the ID
+            # is absent and the short unread-settle window has passed.
+            if (
+                not is_unread
+                and not bool(state.get("seen_unread"))
+                and bool(state.get("codex_foreground_at_completion"))
+                and elapsed >= settle_seconds
+            ):
+                completed.append((thread_id, "already-visible"))
+                continue
+
+            # Stale unread-ID fallback: entering Codex after completion is
+            # treated as a view only for one pending Codex result and only
+            # after focus remains stable for a short delay.
+            focus_at = float(state.get("codex_focus_at") or 0.0)
+            if (
+                allow_focus_fallback
+                and codex_foreground
+                and focus_at > completed_at
+                and elapsed >= settle_seconds
+                and now - focus_at >= focus_delay
+            ):
+                completed.append((thread_id, "codex-focus"))
+
+        for thread_id, reason in completed:
             self.pending_reviews.pop(thread_id, None)
-            LOGGER.info("task result read: thread=%s", thread_id)
+            LOGGER.info(
+                "task result read: thread=%s reason=%s", thread_id, reason
+            )
+
+    @staticmethod
+    def _outcome_for_event(event_type: str) -> str:
+        if event_type == "task_complete":
+            return "complete"
+        if event_type == "task_failed":
+            return "failed"
+        return "cancelled"
+
+    def _record_review(self, *, thread_id: str, turn_id: str = "",
+                       outcome: str = "complete", unread: set[str],
+                       codex_foreground: bool = False,
+                       source: str = "codex") -> None:
+        if not thread_id:
+            return
+        current = self.pending_reviews.get(thread_id)
+        if current and str(current.get("turn_id") or "") == turn_id:
+            if outcome != "complete":
+                current["outcome"] = outcome
+            current["seen_unread"] = bool(current.get("seen_unread")) or thread_id in unread
+            current["codex_foreground_at_completion"] = (
+                bool(current.get("codex_foreground_at_completion"))
+                or codex_foreground
+            )
+            return
+        self.pending_reviews[thread_id] = {
+            "completed_at": time.monotonic(),
+            "seen_unread": thread_id in unread,
+            "outcome": outcome,
+            "turn_id": turn_id,
+            "source": source,
+            "codex_foreground_at_completion": codex_foreground,
+            "codex_focus_at": 0.0,
+        }
+
+    def _hooks_enabled(self, now: float) -> bool:
+        """Return Hook status with a short cache instead of reading JSON 2×/s."""
+        interval = max(
+            1.0, float(self.config.get("hook_status_cache_seconds", 10.0))
+        )
+        if now - self._hooks_status_checked_at >= interval:
+            self._hooks_enabled_cache = hooks_installed()
+            self._hooks_status_checked_at = now
+        return self._hooks_enabled_cache
+
+    def acknowledge_reviews(self) -> None:
+        """Explicit fallback when the Codex read-state is unavailable."""
+        if not self.pending_reviews:
+            return
+        count = len(self.pending_reviews)
+        self.pending_reviews.clear()
+        LOGGER.warning("task results acknowledged manually: count=%d", count)
+        if self.display_mode == "review":
+            display = self.config["display"]
+            self._transition_to(
+                "idle" if display["persistent"] and not display["auto_hide_after_complete"]
+                else "hidden"
+            )
 
     @staticmethod
     def _determine_target(
@@ -289,7 +484,7 @@ class BridgeApp:
 
         # ══ Mode-specific exit transitions ══
         if current_mode == "review" and not has_pending_reviews:
-            if auto_hide_complete and not persistent:
+            if auto_hide_complete or not persistent:
                 target = "hidden"
             elif has_unread:
                 target = "ready"
@@ -304,37 +499,87 @@ class BridgeApp:
         try:
             before, after, events, last_activity = self.watcher.poll()
             unread = self.unread_watcher.poll()
+            hook_events = self.hook_watcher.poll()
 
             # Claude Code session monitoring
             claude_busy, claude_last_activity, claude_completions = \
                 self.claude_watcher.poll()
 
+            has_codex_completion = any(
+                event.get("kind") == "complete" for event in hook_events
+            ) or any(
+                event.get("type") in TERMINAL_EVENT_TYPES for event in events
+            )
+            needs_codex_focus = bool(self.pending_reviews) or has_codex_completion
+            codex_foreground = (
+                _is_codex_foreground() if needs_codex_focus else False
+            )
+
+            # Official Codex lifecycle hooks are the primary signal.  JSONL
+            # remains active as a fallback for clients where hooks are absent.
+            for hook_event in hook_events:
+                turn_id = str(hook_event.get("turn_id") or "")
+                thread_id = str(hook_event.get("thread_id") or "")
+                if hook_event.get("kind") == "start" and turn_id:
+                    self.hook_finished_turns.discard(turn_id)
+                    self.hook_active_turns.add(turn_id)
+                elif hook_event.get("kind") == "complete":
+                    self.hook_active_turns.discard(turn_id)
+                    if turn_id:
+                        self.hook_finished_turns.add(turn_id)
+                    self._record_review(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        outcome="complete",
+                        unread=unread,
+                        codex_foreground=codex_foreground,
+                    )
+
             # Feed Codex terminal events into pending_reviews
             for event in events:
                 if event["type"] in TERMINAL_EVENT_TYPES and event["thread_id"]:
-                    self.pending_reviews[event["thread_id"]] = {
-                        "completed_at": time.monotonic(),
-                        "seen_unread": event["thread_id"] in unread,
-                    }
+                    turn_id = event.get("turn_id", "")
+                    self.hook_active_turns.discard(turn_id)
+                    self.hook_finished_turns.discard(turn_id)
+                    self._record_review(
+                        thread_id=event["thread_id"],
+                        turn_id=turn_id,
+                        outcome=self._outcome_for_event(event["type"]),
+                        unread=unread,
+                        codex_foreground=codex_foreground,
+                    )
 
             # Feed Claude Code busy→idle transitions into the same pipeline.
             for comp in claude_completions:
                 if comp.get("thread_id"):
-                    self.pending_reviews[comp["thread_id"]] = {
-                        "completed_at": time.monotonic(),
-                        "seen_unread": False,
-                    }
-
-            self._update_reviews(unread)
+                    self._record_review(
+                        thread_id=comp["thread_id"],
+                        outcome="complete",
+                        unread=unread,
+                        source="claude",
+                    )
 
             now = time.monotonic()
+            self._update_reviews(
+                unread,
+                codex_foreground=codex_foreground,
+                now=now,
+            )
+
+            fallback_active = self.watcher.active_turns - self.hook_finished_turns
+            effective_turns = fallback_active | self.hook_active_turns
+            effective_active_count = len(effective_turns)
             target = self._determine_target(
-                codex_active=after > 0,
+                codex_active=effective_active_count > 0,
                 claude_busy=claude_busy,
                 codex_last_activity=last_activity,
                 now=now,
                 has_pending_reviews=bool(self.pending_reviews),
-                has_unread=bool(unread) and self._unread_is_meaningful(now),
+                has_unread=(
+                    bool(unread)
+                    and bool(self.config["display"]["show_unrelated_unread"])
+                    and self._unread_is_meaningful(now)
+                ),
                 persistent=self.config["display"]["persistent"],
                 auto_hide_complete=self.config["display"]["auto_hide_after_complete"],
                 think_timeout=float(self.config["activity_thresholds"]["thinking_timeout_seconds"]),
@@ -349,17 +594,46 @@ class BridgeApp:
                 self._transition_to(target)
             else:
                 # Same mode — refresh status text
-                self._refresh_status(target, after, unread,
+                self._refresh_status(target, effective_active_count, unread,
                                      claude_busy=claude_busy)
+
+            review_turns = {
+                str(item.get("turn_id") or "")
+                for item in self.pending_reviews.values()
+                if item.get("turn_id")
+            }
+            token_usage = self.watcher.usage_for_turns(
+                effective_turns | review_turns
+            )
+            indicator_status = self._MODE_LABELS.get(
+                self.display_mode, self.display_mode
+            )
+            if self.display_mode == "review":
+                outcomes = {
+                    str(item.get("outcome") or "complete")
+                    for item in self.pending_reviews.values()
+                }
+                if "failed" in outcomes:
+                    indicator_status = "失败"
+                elif outcomes == {"cancelled"}:
+                    indicator_status = "取消"
+                else:
+                    indicator_status = "完成"
 
             # Push a snapshot of bridge state to the window so the
             # right-click menu always shows current info.
             self.window.set_status_info({
                 "mode": self._MODE_LABELS.get(self.display_mode, self.display_mode),
-                "active": str(after) if after else "",
+                "indicator_status": indicator_status,
+                "active": str(effective_active_count) if effective_active_count else "",
                 "unread": str(len(unread)) if unread else "",
                 "claude": "忙碌" if claude_busy else "空闲",
                 "reviews": str(len(self.pending_reviews)) if self.pending_reviews else "",
+                "hooks": "已启用" if self._hooks_enabled(now) else "兼容模式",
+                "token_total": str(token_usage.total_tokens),
+                "token_input": str(token_usage.input_tokens),
+                "token_cached": str(token_usage.cached_input_tokens),
+                "token_output": str(token_usage.output_tokens),
             })
 
         except Exception:
@@ -375,7 +649,14 @@ class BridgeApp:
         elif mode == "thinking":
             tip = f"{tool} 思考中（{active_count} 个任务）" if active_count else f"{tool} 思考中"
         elif mode == "review":
-            tip = f"任务完成，等待查看（{len(self.pending_reviews)}）"
+            outcomes = {str(item.get("outcome") or "complete")
+                        for item in self.pending_reviews.values()}
+            if "failed" in outcomes:
+                tip = f"任务执行失败，等待确认（{len(self.pending_reviews)}）"
+            elif outcomes == {"cancelled"}:
+                tip = f"任务已取消，等待确认（{len(self.pending_reviews)}）"
+            else:
+                tip = f"任务完成，等待查看（{len(self.pending_reviews)}）"
         elif mode == "ready":
             tip = f"有未读消息（{len(unread)} 个会话）"
         elif mode == "idle":
@@ -455,74 +736,12 @@ def current_status(config: dict) -> dict:
     watcher = CodexSessionWatcher(
         sessions_dir=expand_path(config["codex_sessions_dir"]),
         recent_days=int(config["recent_session_days"]),
+        file_cache_ttl_seconds=float(config["session_file_cache_ttl_seconds"]),
     )
     active = watcher.initialize()
     return {
         "ok": True,
         "active_task_count": len(active),
         "active_turn_ids": sorted(active),
+        "hooks_installed": hooks_installed(),
     }
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="蕾米 Codex 外置任务状态桌宠")
-    parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--demo", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> int:
-    # Catch-all exception hook to ensure NO error is silently lost
-    def _log_unhandled(exc_type, exc_value, exc_tb):
-        LOGGER.critical("UNHANDLED EXCEPTION", exc_info=(exc_type, exc_value, exc_tb))
-    sys.excepthook = _log_unhandled
-
-    args = parse_args()
-
-    # Auto-generate config files from embedded defaults on first run
-    init_default_files()
-
-    config = load_config(CONFIG_PATH)
-    if args.self_test:
-        report = {
-            "assets": inspect_assets(config),
-            "codex": current_status(config),
-        }
-        report["ok"] = bool(report["assets"]["ok"] and report["codex"]["ok"])
-        print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0 if report["ok"] else 1
-    if args.status:
-        print(json.dumps(current_status(config), ensure_ascii=False, indent=2))
-        return 0
-
-    # Single-instance check via PID file (stale locks auto-cleaned)
-    if not check_single_instance():
-        try:
-            import tkinter.messagebox as _mb
-            _r = tk.Tk()
-            _r.withdraw()
-            _mb.showinfo(
-                "蕾米 Codex 助手",
-                "蕾米 Codex 助手已在运行中。\n\n"
-                "如果桌宠不可见，请打开任务管理器\n"
-                "结束 pythonw.exe 进程后重试。",
-            )
-            _r.destroy()
-        except Exception:
-            pass
-        LOGGER.info("another instance is already running -- exiting")
-        return 0
-    try:
-        try:
-            BridgeApp(config, demo=args.demo).start()
-        except Exception:
-            LOGGER.exception("fatal error in BridgeApp")
-            return 1
-    finally:
-        release_single_instance()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

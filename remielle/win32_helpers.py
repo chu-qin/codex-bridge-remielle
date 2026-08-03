@@ -116,6 +116,23 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+    def _win32_round_window_region(
+        hwnd: int, width: int, height: int, radius: int
+    ) -> None:
+        """Clip an opaque popup to a native rounded rectangle.
+
+        Unlike Tk's transparent-colour attribute this keeps the window
+        non-layered, so Windows can retain ClearType text rendering.
+        """
+        try:
+            diameter = max(2, int(radius) * 2)
+            rgn = _ctypes.windll.gdi32.CreateRoundRectRgn(
+                0, 0, int(width) + 1, int(height) + 1, diameter, diameter
+            )
+            _ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception:
+            pass
+
     def _get_virtual_screen_bounds() -> tuple[int, int, int, int] | None:
         """Return ``(left, top, right, bottom)`` of the virtual desktop
         spanning **all** monitors, or ``None`` on failure.
@@ -136,6 +153,53 @@ if sys.platform == "win32":
         except Exception:
             return None
 
+    class _MONITORINFO(_ctypes.Structure):
+        _fields_ = [
+            ("cbSize", _w32.DWORD),
+            ("rcMonitor", _w32.RECT),
+            ("rcWork", _w32.RECT),
+            ("dwFlags", _w32.DWORD),
+        ]
+
+    def _get_monitor_work_area_for_rect(
+        x: int, y: int, width: int = 1, height: int = 1
+    ) -> tuple[int, int, int, int] | None:
+        """Return the nearest monitor's usable work area for a window rect.
+
+        Unlike the virtual-screen bounding rectangle, a monitor work area
+        cannot point into a gap between displays and excludes the taskbar.
+        ``MONITOR_DEFAULTTONEAREST`` also recovers windows whose saved
+        coordinates belong to a monitor that has since been disconnected.
+        """
+        try:
+            user32 = _ctypes.windll.user32
+            monitor_from_rect = user32.MonitorFromRect
+            monitor_from_rect.argtypes = [
+                _ctypes.POINTER(_w32.RECT), _w32.DWORD,
+            ]
+            monitor_from_rect.restype = _w32.HANDLE
+            get_monitor_info = user32.GetMonitorInfoW
+            get_monitor_info.argtypes = [
+                _w32.HANDLE, _ctypes.POINTER(_MONITORINFO),
+            ]
+            get_monitor_info.restype = _w32.BOOL
+            rect = _w32.RECT(
+                int(x), int(y),
+                int(x) + max(1, int(width)),
+                int(y) + max(1, int(height)),
+            )
+            monitor = monitor_from_rect(_ctypes.byref(rect), 2)
+            if not monitor:
+                return None
+            info = _MONITORINFO()
+            info.cbSize = _ctypes.sizeof(_MONITORINFO)
+            if not get_monitor_info(monitor, _ctypes.byref(info)):
+                return None
+            work = info.rcWork
+            return (work.left, work.top, work.right, work.bottom)
+        except Exception:
+            return None
+
     def _get_cursor_pos() -> tuple[int, int] | None:
         """Return ``(x, y)`` of the cursor in screen coordinates.
 
@@ -146,6 +210,87 @@ if sys.platform == "win32":
         if _ctypes.windll.user32.GetCursorPos(_ctypes.byref(pt)):
             return (pt.x, pt.y)
         return None
+
+    # Cache the foreground process classification by PID.  The bridge only
+    # calls this while a result is waiting to be reviewed, so the steady-state
+    # cost is zero and the review-state cost is one cheap HWND/PID lookup.
+    _foreground_process_cache: dict[int, bool] = {}
+
+    _foreground_user32 = _ctypes.windll.user32
+    _foreground_kernel32 = _ctypes.windll.kernel32
+    _foreground_user32.GetForegroundWindow.restype = _w32.HWND
+    _foreground_user32.GetWindowThreadProcessId.argtypes = [
+        _w32.HWND, _ctypes.POINTER(_w32.DWORD),
+    ]
+    _foreground_user32.GetWindowThreadProcessId.restype = _w32.DWORD
+    _foreground_kernel32.OpenProcess.argtypes = [
+        _w32.DWORD, _w32.BOOL, _w32.DWORD,
+    ]
+    _foreground_kernel32.OpenProcess.restype = _w32.HANDLE
+    _foreground_kernel32.QueryFullProcessImageNameW.argtypes = [
+        _w32.HANDLE, _w32.DWORD, _w32.LPWSTR,
+        _ctypes.POINTER(_w32.DWORD),
+    ]
+    _foreground_kernel32.QueryFullProcessImageNameW.restype = _w32.BOOL
+    _foreground_kernel32.CloseHandle.argtypes = [_w32.HANDLE]
+    _foreground_kernel32.CloseHandle.restype = _w32.BOOL
+
+    def _is_codex_process(process_id: int) -> bool:
+        cached = _foreground_process_cache.get(process_id)
+        if cached is not None:
+            return cached
+
+        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = _foreground_kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, process_id
+        )
+        if not handle:
+            _foreground_process_cache[process_id] = False
+            return False
+        try:
+            capacity = _w32.DWORD(32768)
+            buffer = _ctypes.create_unicode_buffer(capacity.value)
+            ok = _foreground_kernel32.QueryFullProcessImageNameW(
+                handle, 0, buffer, _ctypes.byref(capacity)
+            )
+            image_path = buffer.value.lower().replace("/", "\\") if ok else ""
+        finally:
+            _foreground_kernel32.CloseHandle(handle)
+
+        is_codex = (
+            image_path.endswith("\\codex.exe")
+            or (
+                image_path.endswith("\\chatgpt.exe")
+                and "\\openai.codex_" in image_path
+            )
+        )
+        if len(_foreground_process_cache) > 32:
+            _foreground_process_cache.clear()
+        _foreground_process_cache[process_id] = is_codex
+        return is_codex
+
+    def _is_codex_foreground() -> bool:
+        """Return whether the foreground window belongs to Codex Desktop.
+
+        The Microsoft Store build currently hosts Codex in ``ChatGPT.exe``
+        under an ``OpenAI.Codex_*`` package directory.  ``codex.exe`` is also
+        accepted for future/non-Store builds.  Process image checks are cached
+        by PID to avoid opening a process handle on every poll.
+        """
+        try:
+            hwnd = _foreground_user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            pid = _w32.DWORD()
+            _foreground_user32.GetWindowThreadProcessId(
+                hwnd, _ctypes.byref(pid)
+            )
+            process_id = int(pid.value)
+            if not process_id:
+                return False
+            return _is_codex_process(process_id)
+        except Exception:
+            return False
 
     # ── Native Windows popup menu (independent of tkinter's window system) ──
     # tk_popup on an overrideredirect + transparent-color window causes
@@ -238,11 +383,27 @@ else:
     def _win32_clip_window_region(hwnd: int, width: int, height: int) -> None:
         pass
 
+    def _win32_round_window_region(
+        hwnd: int, width: int, height: int, radius: int
+    ) -> None:
+        pass
+
     def _get_virtual_screen_bounds() -> None:
+        return None
+
+    def _get_monitor_work_area_for_rect(
+        x: int, y: int, width: int = 1, height: int = 1
+    ) -> None:
         return None
 
     def _get_cursor_pos() -> None:
         return None
+
+    def _is_codex_foreground() -> bool:
+        return False
+
+    def _is_codex_process(process_id: int) -> bool:
+        return False
 
     def _native_create_menu() -> int:
         return 0

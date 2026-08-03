@@ -390,8 +390,18 @@ class ControlPanel:
             font=("Microsoft YaHei UI", 9, "bold"),
         ).pack(side="left", padx=(6, 0))
 
+        self.size_current_label = tk.Label(
+            self.size_page,
+            text="",
+            bg=self.bg,
+            fg=self.muted,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        )
+        self.size_current_label.pack(fill="x", padx=4, pady=(0, 7))
+
         self.size_buttons: dict[int, RoundedButton] = {}
-        for pct in (40, 60, 75, 100, 125):
+        for pct in (50, 75, 100, 150, 200):
             button = self._menu_item(
                 self.size_page,
                 f"{pct}%",
@@ -626,6 +636,9 @@ class ControlPanel:
         )
 
         current_pct = round(self.window.scale * 100)
+        self.size_current_label.configure(
+            text=f"当前 {current_pct}%  ·  滚轮每次 5%"
+        )
         for pct, button in self.size_buttons.items():
             selected = pct == current_pct
             button.set_style(
