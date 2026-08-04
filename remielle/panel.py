@@ -255,7 +255,7 @@ class ControlPanel:
         self._bind_drag(title_box)
         title = tk.Label(
             title_box,
-            text="蕾米",
+            text="蕾米埃尔 AI 助手",
             bg=self.bg,
             fg=self.text,
             font=("Microsoft YaHei UI", 10, "bold"),
@@ -295,13 +295,13 @@ class ControlPanel:
             self.main_page, "", self._toggle_autohide,
         )
         self.size_btn = self._menu_item(
-            self.main_page, "桌宠大小  ›", self._show_sizes,
+            self.main_page, "显示大小  ›", self._show_sizes,
         )
         self.more_btn = self._menu_item(
             self.main_page, "更多设置  ›", self._show_more,
         )
         self._menu_item(
-            self.main_page, "隐藏桌宠", self._hide_pet,
+            self.main_page, "隐藏", self._hide_pet,
             foreground=self.muted,
         )
         self._menu_item(
@@ -564,7 +564,7 @@ class ControlPanel:
                 uninstall_hooks()
                 messagebox.showinfo(
                     "Codex Hooks",
-                    "蕾米 Hooks 已卸载，重启 Codex 后生效。",
+                    "Hooks 已卸载，重启 Codex 后生效。",
                     parent=self.top,
                 )
             else:
@@ -572,7 +572,7 @@ class ControlPanel:
                 messagebox.showinfo(
                     "Codex Hooks 已安装",
                     f"配置位置：\n{user_hooks_path()}\n\n"
-                    "请重启 Codex，并在 /hooks 中信任两个蕾米命令。",
+                    "请重启 Codex，并在 /hooks 中信任两个命令。",
                     parent=self.top,
                 )
         except Exception as error:
@@ -637,7 +637,7 @@ class ControlPanel:
 
         current_pct = round(self.window.scale * 100)
         self.size_current_label.configure(
-            text=f"当前 {current_pct}%  ·  滚轮每次 5%"
+            text=f"当前 {current_pct}%"
         )
         for pct, button in self.size_buttons.items():
             selected = pct == current_pct
