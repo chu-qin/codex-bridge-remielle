@@ -7,6 +7,19 @@ settings.json
 __pycache__/
 *.pyc
 
+# 个人运行配置（app 启动时用内置默认自动重建，不入仓库）
+config.json
+assets/坐标配置.json
+
+# 测试与开发辅助（运行项目不需要，不入仓库）
+remielle/tests/
+DEVELOPMENT.md
+CHANGELOG.md
+docs/
+requirements-dev.txt
+remielle.spec
+构建发布版.ps1
+
 # IDE
 .vscode/
 .idea/

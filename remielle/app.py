@@ -11,7 +11,8 @@ from PIL import Image
 from .config import (APP_DIR, CONFIG_PATH, _DEFAULT_COORDINATES,
                      TERMINAL_EVENT_TYPES, LOGGER,
                      expand_path, load_json)
-from .watchers import CodexSessionWatcher, CodexUnreadWatcher, ClaudeSessionWatcher
+from .watchers import (CodexSessionWatcher, CodexUnreadWatcher,
+                       ClaudeSessionWatcher, TokenUsage)
 from .hooks import HookEventWatcher, hooks_installed
 from .win32_helpers import _is_codex_foreground
 from .window import RemielleWindow
@@ -34,6 +35,11 @@ class BridgeApp:
         self.claude_watcher = ClaudeSessionWatcher(
             expand_path(config["claude_sessions_dir"]),
             scan_interval_seconds=float(config["claude_scan_interval_seconds"]),
+            projects_dir=expand_path(config["claude_projects_dir"]),
+            recent_days=int(config["recent_session_days"]),
+            token_scan_interval_seconds=float(
+                config["claude_token_scan_interval_seconds"]
+            ),
         )
         self.hook_watcher = HookEventWatcher(
             max_age_hours=float(config["hook_queue_max_age_hours"]),
@@ -505,6 +511,21 @@ class BridgeApp:
             claude_busy, claude_last_activity, claude_completions = \
                 self.claude_watcher.poll()
 
+            # Claude Code token usage: live delta while busy, frozen delta
+            # while a Claude result awaits review.  Claude reviews carry no
+            # Codex ``turn_id``, so ``review_turns`` never includes them —
+            # this explicit source check covers the frozen delta instead.
+            claude_review_pending = any(
+                str(item.get("source") or "") == "claude"
+                for item in self.pending_reviews.values()
+            )
+            if claude_busy:
+                claude_usage = self.claude_watcher.active_usage
+            elif claude_review_pending:
+                claude_usage = self.claude_watcher.review_usage
+            else:
+                claude_usage = TokenUsage()
+
             has_codex_completion = any(
                 event.get("kind") == "complete" for event in hook_events
             ) or any(
@@ -602,8 +623,9 @@ class BridgeApp:
                 for item in self.pending_reviews.values()
                 if item.get("turn_id")
             }
-            token_usage = self.watcher.usage_for_turns(
-                effective_turns | review_turns
+            token_usage = (
+                self.watcher.usage_for_turns(effective_turns | review_turns)
+                + claude_usage
             )
             indicator_status = self._MODE_LABELS.get(
                 self.display_mode, self.display_mode

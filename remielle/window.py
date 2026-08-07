@@ -18,7 +18,7 @@ from .config import (APP_DIR, _DEFAULT_COORDINATES, SETTINGS_PATH, CONFIG_PATH,
                      expand_path, load_json)
 from .win32_helpers import (_win32_set_clickthrough, _win32_remove_window_border,
                             _win32_clip_window_region, _get_virtual_screen_bounds,
-                            _get_monitor_work_area_for_rect,
+                            _get_monitor_work_area_for_rect, _clamp_window_to_bounds,
                             _native_create_menu, _native_destroy_menu,
                             _native_add_item, _native_add_check, _native_add_sep,
                             _native_add_sub, _native_track)
@@ -50,30 +50,6 @@ def _prepare_colorkey_frame(
     foreground = frame.convert("RGB")
     background = Image.new("RGB", frame.size, transparent_rgb)
     return Image.composite(foreground, background, binary_mask)
-
-
-def _clamp_window_to_bounds(
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    bounds: tuple[int, int, int, int],
-    margin: int,
-) -> tuple[int, int]:
-    """Keep a window fully visible when it fits, otherwise keep a handle."""
-    left, top, right, bottom = bounds
-    area_width = max(1, right - left)
-    area_height = max(1, bottom - top)
-    margin = max(1, int(margin))
-    if width <= area_width:
-        x = max(left, min(int(x), right - width))
-    else:
-        x = max(left - width + margin, min(int(x), right - margin))
-    if height <= area_height:
-        y = max(top, min(int(y), bottom - height))
-    else:
-        y = max(top - height + margin, min(int(y), bottom - margin))
-    return x, y
 
 
 class RemielleWindow:
@@ -673,6 +649,15 @@ class RemielleWindow:
         # moves from one side to another.
         self.settings["x"] = pet_screen_x - self._pet_origin_x
         self.settings["y"] = pet_screen_y - self._pet_origin_y
+        self._apply_geometry()
+
+    def set_indicator_position(self, position: str) -> None:
+        """Set the indicator to an explicit position (used by the panel's
+        radio rows, complementing the cycle button)."""
+        if position not in ("right", "bottom", "left", "top"):
+            return
+        self.settings["indicator_position"] = position
+        self._indicator_layout_key = None
         self._apply_geometry()
 
     def acknowledge_results(self) -> None:

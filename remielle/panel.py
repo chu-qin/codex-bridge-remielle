@@ -1,3 +1,14 @@
+"""
+控制面板（弹窗菜单）模块。
+
+负责桌宠右键弹出的圆角菜单：显示状态、开关常驻/自动隐藏、
+调整桌宠大小、管理 Codex Hooks、切换状态条位置、退出等。
+
+菜单是一棵**悬停级联**树：根 Toplevel 显示一级条目，带子菜单的条目
+在鼠标悬停时于其右侧（空间不足时翻到左侧）飞出独立的子面板，无需点击。
+所有颜色/字体等外观参数均来自 config["ui"]（见 config.py），
+可直接修改 config.json 里的 "ui" 段来换肤，无需改代码。
+"""
 from __future__ import annotations
 
 import sys
@@ -8,7 +19,19 @@ from PIL import Image, ImageTk
 
 from .config import LOGGER
 from .hooks import hooks_installed, install_hooks, uninstall_hooks, user_hooks_path
-from .win32_helpers import _win32_round_window_region
+from .win32_helpers import (_win32_round_window_region,
+                            _get_virtual_screen_bounds,
+                            _get_monitor_work_area_for_rect,
+                            _clamp_window_to_bounds)
+
+# 级联菜单的时序与几何常量。开/关双计时避免悬停时的 Enter/Leave 闪烁：
+# 从父按钮滑进子菜单时，父按钮的 Leave 先排一个延迟关闭，子菜单的 Enter
+# 会在计时到期前取消它。
+OPEN_DELAY_MS = 150      # 悬停多久后打开子菜单
+CLOSE_DELAY_MS = 300     # 离开菜单树多久后关闭
+MENU_MIN_WIDTH = 196     # 面板最小宽度（原硬编码 196）
+MENU_RADIUS = 24         # 圆角半径（原硬编码 24）
+MENU_GAP = 2             # 子菜单与父按钮之间的间隙
 
 
 def _rounded_rectangle(
@@ -50,7 +73,9 @@ def _rounded_rectangle(
 
 
 class RoundedButton(tk.Canvas):
-    """Small Canvas button that stays lighter than a themed widget set."""
+    """Small Canvas button that stays lighter than a themed widget set.
+    自绘圆角按钮：不用 ttk 主题，直接画圆角矩形，颜色可随时 set_style 换。
+    """
 
     def __init__(
         self,
@@ -58,14 +83,14 @@ class RoundedButton(tk.Canvas):
         text: str,
         command,
         *,
-        background: str,
-        hover: str,
-        foreground: str,
-        outline: str = "",
-        height: int = 30,
-        width: int = 58,
-        radius: int = 10,
-        font=("Microsoft YaHei UI", 9),
+        background: str,   # 普通态背景色
+        hover: str,        # 悬停态背景色
+        foreground: str,   # 文字颜色
+        outline: str = "", # 描边颜色（空=无描边）
+        height: int = 30,  # 按钮高度
+        width: int = 58,   # 按钮宽度
+        radius: int = 10,  # 圆角半径
+        font=("Microsoft YaHei UI", 9),  # 字体
     ) -> None:
         super().__init__(
             parent,
@@ -144,26 +169,52 @@ class RoundedButton(tk.Canvas):
         self._redraw()
 
 
-class ControlPanel:
-    """Airy, rounded popup menu for the desktop pet."""
+class MenuFlyout:
+    """A hover-opened cascade submenu: a withdrawn Toplevel panel.
 
-    TRANSPARENT = "#010203"
+    Holds the widget tree plus the open/close timer state.  Timing and
+    positioning logic lives on ``ControlPanel`` so the flyout stays a plain
+    data holder (testable with fakes).
+    """
+
+    __slots__ = ("top", "shell", "body", "body_window",
+                 "parent_btn", "mapped", "open_job", "close_job")
+
+    def __init__(self, top, shell, body, body_window) -> None:
+        self.top = top
+        self.shell = shell
+        self.body = body
+        self.body_window = body_window
+        self.parent_btn = None          # RoundedButton that opens this flyout
+        self.mapped = False             # flyout is currently visible
+        self.open_job = None            # pending ``after`` id for open
+        self.close_job = None           # pending ``after`` id for close
+
+
+class ControlPanel:
+    """Airy, rounded popup menu for the desktop pet.
+
+    主面板：无边框圆角 Toplevel。一级菜单固定展示；带子菜单的条目在悬停时
+    于其右侧飞出独立子面板（空间不足时翻到左侧），不再需要翻页点击。
+    """
 
     def __init__(self, window) -> None:
         self.window = window
         self.root = window.root
+        # 配色从 config["ui"] 读取：改 config.json 的 ui 段即可换肤
         palette = window.config["ui"]
-        self.bg = palette["background"]
-        self.surface = palette["surface"]
-        self.hover = palette["surface_hover"]
-        self.accent = palette["accent"]
-        self.text = palette["text"]
-        self.muted = palette["muted"]
-        self.border = palette.get("border", "#eadde1")
-        self.accent_soft = palette.get("accent_soft", "#f6e3e9")
-        self.danger = palette.get("danger", "#b85c6d")
+        self.bg = palette["background"]        # 面板底色
+        self.surface = palette["surface"]      # 普通按钮底色
+        self.hover = palette["surface_hover"]  # 按钮悬停色
+        self.accent = palette["accent"]        # 强调色（主按钮/选中态）
+        self.text = palette["text"]            # 主文字色
+        self.muted = palette["muted"]          # 次要文字色
+        self.border = palette.get("border", "#eadde1")            # 描边
+        self.accent_soft = palette.get("accent_soft", "#f6e3e9")  # 浅强调底
+        self.danger = palette.get("danger", "#b85c6d")            # 危险/退出
         self._drag: tuple[int, int, int, int] | None = None
         self._status = "等待状态同步"
+        self._open_flyouts: list[MenuFlyout] = []
 
         self.top = tk.Toplevel(self.root)
         self.top.withdraw()
@@ -191,45 +242,45 @@ class ControlPanel:
 
         self._build_header()
 
-        # Keep the first level intentionally tiny. Less common actions live on
-        # a second page in the same popup, so no extra window or module is
-        # needed and the menu stays cheap to create.
+        # 一级菜单固定展示；子菜单是独立的悬停飞出面板。
         self.main_page = tk.Frame(self.body, bg=self.bg)
         self.main_page.pack(fill="both", expand=True)
-        self.more_page = tk.Frame(self.body, bg=self.bg)
-        self.size_page = tk.Frame(self.body, bg=self.bg)
-        self.indicator_page = tk.Frame(self.body, bg=self.bg)
 
         self.ack_btn = self._button(
             self.main_page,
             "✓  已查看任务结果",
-            self.window.acknowledge_results,
+            lambda: (self.window.acknowledge_results(), self.hide()),
             accent=True,
             height=32,
         )
-        self._build_main_page()
-        self._build_more_page()
-        self._build_size_page()
-        self._build_indicator_page()
+
+        self._flyouts: dict[str, MenuFlyout] = {}
+        self._build_flyouts()
+        self._build_root_menu()
 
     def _layout_shell(self, event) -> None:
-        self.shell.delete("panel-shape")
+        self._layout_round_shell(self.shell, event, self._body_window, "panel-shape")
+
+    def _layout_round_shell(self, canvas, event, body_window, tag) -> None:
+        """Draw the rounded background/border on ``canvas`` and keep the
+        content ``body_window`` inset.  Shared by the root and the flyouts."""
+        canvas.delete(tag)
         _rounded_rectangle(
-            self.shell,
+            canvas,
             1,
             1,
             max(2, event.width - 1),
             max(2, event.height - 1),
-            24,
+            MENU_RADIUS,
             fill=self.bg,
             outline=self.border,
             width=1,
-            tags="panel-shape",
+            tags=tag,
         )
-        self.shell.tag_lower("panel-shape")
-        self.shell.coords(self._body_window, 8, 7)
-        self.shell.itemconfigure(
-            self._body_window,
+        canvas.tag_lower(tag)
+        canvas.coords(body_window, 8, 7)
+        canvas.itemconfigure(
+            body_window,
             width=max(1, event.width - 16),
             height=max(1, event.height - 14),
         )
@@ -287,27 +338,320 @@ class ControlPanel:
             font=("Microsoft YaHei UI", 11),
         ).pack(side="right")
 
-    def _build_main_page(self) -> None:
+    # ── Root menu (level 1) ──────────────────────────────────────────
+
+    def _build_root_menu(self) -> None:
+        # 一级：常驻 / 查看后隐藏 / 桌宠大小 › / 状态与 Token › / 更多设置 › / 隐藏 / 退出
         self.persistent_btn = self._menu_item(
             self.main_page, "", self._toggle_persistent,
         )
         self.autohide_btn = self._menu_item(
             self.main_page, "", self._toggle_autohide,
         )
-        self.size_btn = self._menu_item(
-            self.main_page, "显示大小  ›", self._show_sizes,
+        self.size_btn = self._cascade_item(
+            self.main_page, "size", "桌宠大小  ›",
         )
-        self.more_btn = self._menu_item(
-            self.main_page, "更多设置  ›", self._show_more,
+        self.status_btn = self._cascade_item(
+            self.main_page, "status", "状态与 Token  ›",
         )
-        self._menu_item(
-            self.main_page, "隐藏", self._hide_pet,
-            foreground=self.muted,
+        self.more_btn = self._cascade_item(
+            self.main_page, "more", "更多设置  ›",
         )
-        self._menu_item(
-            self.main_page, "退出", self.window.on_exit,
-            foreground=self.danger,
+        self._action_item(
+            self.main_page, "隐藏", self._hide_pet, foreground=self.muted,
         )
+        self._action_item(
+            self.main_page, "退出", self.window.on_exit, foreground=self.danger,
+        )
+
+    def _cascade_item(self, parent, key: str, text: str) -> RoundedButton:
+        """Build a root item that opens a hover flyout.
+
+        ``add="+"`` keeps ``RoundedButton``'s own hover-highlight bindings
+        while adding the cascade open/close handlers.
+        """
+        flyout = self._flyouts[key]
+        button = self._menu_item(
+            parent, text, lambda: self._open_flyout(flyout),
+        )
+        button.bind(
+            "<Enter>",
+            lambda _e, f=flyout: self._on_cascade_enter(f),
+            add="+",
+        )
+        button.bind(
+            "<Leave>",
+            lambda _e, f=flyout: self._on_cascade_leave(f),
+            add="+",
+        )
+        flyout.parent_btn = button
+        return button
+
+    # ── Flyout construction ──────────────────────────────────────────
+
+    def _build_flyouts(self) -> None:
+        for key, builder in (
+            ("size", self._build_size_flyout),
+            ("status", self._build_status_flyout),
+            ("more", self._build_more_flyout),
+        ):
+            flyout = self._make_flyout()
+            builder(flyout)
+            self._flyouts[key] = flyout
+
+    def _make_flyout(self) -> MenuFlyout:
+        top = tk.Toplevel(self.root)
+        top.withdraw()
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.configure(bg=self.bg)
+        top.title("蕾米子菜单")
+        shell = tk.Canvas(top, bg=self.bg, bd=0, highlightthickness=0)
+        shell.pack(fill="both", expand=True)
+        body = tk.Frame(shell, bg=self.bg, padx=6, pady=5)
+        body_window = shell.create_window(8, 8, anchor="nw", window=body)
+        shell.bind(
+            "<Configure>",
+            lambda event, c=shell, bw=body_window: self._layout_round_shell(
+                c, event, bw, "flyout-shape"
+            ),
+        )
+        flyout = MenuFlyout(top, shell, body, body_window)
+        # 鼠标从父按钮滑进子菜单时，子菜单的 Enter 取消父级的延迟关闭，
+        # 避免菜单闪关；离开子菜单则排一个延迟关闭。
+        top.bind("<Enter>", lambda _e: self._on_flyout_enter(flyout))
+        top.bind("<Leave>", lambda _e: self._on_flyout_leave(flyout))
+        shell.bind("<Enter>", lambda _e: self._on_flyout_enter(flyout), add="+")
+        shell.bind("<Leave>", lambda _e: self._on_flyout_leave(flyout), add="+")
+        top.bind("<Escape>", lambda _e: self.hide())
+        return flyout
+
+    def _build_size_flyout(self, flyout: MenuFlyout) -> None:
+        heading = tk.Frame(flyout.body, bg=self.bg)
+        heading.pack(fill="x", pady=(0, 9))
+        tk.Label(
+            heading,
+            text="桌宠大小",
+            bg=self.bg,
+            fg=self.text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        self.size_current_label = tk.Label(
+            flyout.body,
+            text="",
+            bg=self.bg,
+            fg=self.muted,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        )
+        self.size_current_label.pack(fill="x", padx=4, pady=(0, 7))
+
+        self.size_buttons: dict[int, RoundedButton] = {}
+        for pct in (50, 75, 100, 150, 200):
+            button = self._menu_item(
+                flyout.body,
+                f"{pct}%",
+                lambda value=pct: self._set_scale(value),
+            )
+            self.size_buttons[pct] = button
+
+    def _build_status_flyout(self, flyout: MenuFlyout) -> None:
+        heading = tk.Frame(flyout.body, bg=self.bg)
+        heading.pack(fill="x", pady=(0, 9))
+        tk.Label(
+            heading,
+            text="状态与 Token",
+            bg=self.bg,
+            fg=self.text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        self.indicator_toggle_btn = self._menu_item(
+            flyout.body, "", self._toggle_indicator,
+        )
+
+        tk.Label(
+            flyout.body,
+            text="位置",
+            bg=self.bg,
+            fg=self.muted,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        ).pack(fill="x", padx=4, pady=(0, 2))
+
+        # 位置单选行直接内嵌，保持层级封顶在 2 层（无需再进三级子菜单）。
+        self.indicator_radio_buttons: dict[str, RoundedButton] = {}
+        for pos, label in (
+            ("right", "右侧 · 纵向"),
+            ("bottom", "下方 · 横向"),
+            ("left", "左侧 · 纵向"),
+            ("top", "上方 · 横向"),
+        ):
+            button = self._menu_item(
+                flyout.body,
+                label,
+                lambda value=pos: (
+                    self.window.set_indicator_position(value),
+                    self.refresh(),
+                ),
+            )
+            self.indicator_radio_buttons[pos] = button
+
+    def _build_more_flyout(self, flyout: MenuFlyout) -> None:
+        heading = tk.Frame(flyout.body, bg=self.bg)
+        heading.pack(fill="x", pady=(0, 9))
+        tk.Label(
+            heading,
+            text="更多设置",
+            bg=self.bg,
+            fg=self.text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+
+        self._action_item(flyout.body, "演示全部动作", self.window._menu_demo_all)
+        self._action_item(flyout.body, "运行资源自检", self.window._menu_run_selftest)
+        self._action_item(flyout.body, "重置桌宠位置", self.window.reset_geometry)
+        self.hook_btn = self._action_item(
+            flyout.body, "Codex Hooks", self._toggle_hooks,
+        )
+        self.autostart_btn = self._action_item(
+            flyout.body, self.window._autostart_label, self._toggle_autostart,
+        )
+
+    # ── Cascade timing (hover open / grace close) ────────────────────
+
+    def _cancel_job(self, job_id: str | None) -> None:
+        if job_id is None:
+            return
+        try:
+            self.top.after_cancel(job_id)
+        except tk.TclError:
+            pass
+
+    def _cancel_open(self, flyout: MenuFlyout) -> None:
+        if flyout.open_job is not None:
+            self._cancel_job(flyout.open_job)
+            flyout.open_job = None
+
+    def _cancel_close(self, flyout: MenuFlyout) -> None:
+        if flyout.close_job is not None:
+            self._cancel_job(flyout.close_job)
+            flyout.close_job = None
+
+    def _schedule_open(self, flyout: MenuFlyout) -> None:
+        self._cancel_close(flyout)
+        if flyout.mapped or flyout.open_job is not None:
+            return
+        flyout.open_job = self.top.after(
+            OPEN_DELAY_MS, lambda: self._open_flyout(flyout)
+        )
+
+    def _schedule_close(self, flyout: MenuFlyout) -> None:
+        self._cancel_open(flyout)
+        if flyout.close_job is not None:
+            return
+        flyout.close_job = self.top.after(
+            CLOSE_DELAY_MS, lambda: self._close_flyout(flyout)
+        )
+
+    def _on_cascade_enter(self, flyout: MenuFlyout) -> None:
+        self._cancel_close(flyout)
+        self._close_siblings(flyout)
+        self._schedule_open(flyout)
+
+    def _on_cascade_leave(self, flyout: MenuFlyout) -> None:
+        self._cancel_open(flyout)
+        self._schedule_close(flyout)
+
+    def _on_flyout_enter(self, flyout: MenuFlyout) -> None:
+        self._cancel_close(flyout)
+
+    def _on_flyout_leave(self, flyout: MenuFlyout) -> None:
+        self._schedule_close(flyout)
+
+    # ── Flyout open/close ────────────────────────────────────────────
+
+    def _open_flyout(self, flyout: MenuFlyout) -> None:
+        self._cancel_open(flyout)
+        self._cancel_close(flyout)
+        if flyout.mapped or self.top.state() == "withdrawn":
+            return
+        self._close_siblings(flyout)
+        self._fit_flyout(flyout)
+        flyout.top.deiconify()
+        flyout.top.update_idletasks()
+        flyout.top.lift()
+        flyout.mapped = True
+        self._open_flyouts.append(flyout)
+
+    def _close_flyout(self, flyout: MenuFlyout) -> None:
+        self._cancel_open(flyout)
+        self._cancel_close(flyout)
+        if flyout in self._open_flyouts:
+            self._open_flyouts.remove(flyout)
+        if flyout.mapped:
+            flyout.mapped = False
+            try:
+                flyout.top.withdraw()
+            except tk.TclError:
+                pass
+
+    def _close_siblings(self, flyout: MenuFlyout) -> None:
+        for other in list(self._open_flyouts):
+            if other is not flyout:
+                self._close_flyout(other)
+
+    def _close_all(self) -> None:
+        for flyout in list(self._open_flyouts):
+            self._close_flyout(flyout)
+
+    def _schedule_fit_flyout(self, flyout: MenuFlyout) -> None:
+        if flyout.mapped:
+            flyout.top.after_idle(lambda f=flyout: self._fit_flyout(f))
+
+    def _fit_flyout(self, flyout: MenuFlyout) -> None:
+        flyout.body.update_idletasks()
+        width = max(MENU_MIN_WIDTH, flyout.body.winfo_reqwidth() + 16)
+        height = flyout.body.winfo_reqheight() + 14
+        x, y = self._flyout_origin(flyout, width, height)
+        flyout.top.geometry(f"{width}x{height}+{x}+{y}")
+        flyout.top.update_idletasks()
+        if sys.platform == "win32":
+            _win32_round_window_region(
+                flyout.top.winfo_id(), width, height, MENU_RADIUS
+            )
+        flyout.top.lift()
+
+    def _flyout_origin(
+        self, flyout: MenuFlyout, width: int, height: int
+    ) -> tuple[int, int]:
+        """Place the flyout to the right of its parent button, top-aligned;
+        flip to the left when it would overflow the monitor's right edge."""
+        btn = flyout.parent_btn
+        px = btn.winfo_rootx()
+        py = btn.winfo_rooty()
+        pw = btn.winfo_width()
+        ph = btn.winfo_height()
+        x = px + pw + MENU_GAP
+        y = py
+        right = self._screen_right(px, py, pw, ph)
+        if right is not None and x + width > right:
+            x = px - width - MENU_GAP
+        return self._clamped_menu_pos(x, y, width, height)
+
+    def _screen_right(self, px: int, py: int, pw: int, ph: int) -> int | None:
+        """Right edge of the monitor nearest the button (work area first,
+        virtual screen second, Tk screen as the non-Windows fallback)."""
+        bounds = _get_monitor_work_area_for_rect(px, py, pw, ph)
+        if bounds:
+            return bounds[2]
+        virt = _get_virtual_screen_bounds()
+        if virt:
+            return virt[2]
+        return self.top.winfo_screenwidth()
+
+    # ── Shared helpers ───────────────────────────────────────────────
 
     def _menu_item(
         self,
@@ -330,140 +674,22 @@ class ControlPanel:
         button.pack(fill="x", pady=(0, 2))
         return button
 
-    def _build_more_page(self) -> None:
-        heading = tk.Frame(self.more_page, bg=self.bg)
-        heading.pack(fill="x", pady=(0, 9))
-        self._button(
-            heading,
-            "‹  返回",
-            self._show_main,
-            background=self.bg,
-            hover=self.accent_soft,
-            foreground=self.accent,
-            width=62,
-            height=28,
-        ).pack(side="left")
-        tk.Label(
-            heading,
-            text="更多设置",
-            bg=self.bg,
-            fg=self.text,
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(6, 0))
-
-        self.indicator_settings_btn = self._menu_item(
-            self.more_page, "状态与 Token  ›", self._show_indicator,
-        )
-
-        tools = (
-            ("演示全部动作", self.window._menu_demo_all),
-            ("运行资源自检", self.window._menu_run_selftest),
-            ("重置桌宠位置", self.window.reset_geometry),
-        )
-        for label, command in tools:
-            self._menu_item(self.more_page, label, command)
-        self.hook_btn = self._menu_item(
-            self.more_page, "Codex Hooks", self._toggle_hooks,
-        )
-        self.autostart_btn = self._menu_item(
-            self.more_page, self.window._autostart_label, self._toggle_autostart,
-        )
-
-    def _build_size_page(self) -> None:
-        heading = tk.Frame(self.size_page, bg=self.bg)
-        heading.pack(fill="x", pady=(0, 9))
-        self._button(
-            heading,
-            "‹  返回",
-            self._show_main,
-            background=self.bg,
-            hover=self.accent_soft,
-            foreground=self.accent,
-            width=62,
-            height=28,
-        ).pack(side="left")
-        tk.Label(
-            heading,
-            text="桌宠大小",
-            bg=self.bg,
-            fg=self.text,
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(6, 0))
-
-        self.size_current_label = tk.Label(
-            self.size_page,
-            text="",
-            bg=self.bg,
-            fg=self.muted,
-            font=("Microsoft YaHei UI", 8),
-            anchor="w",
-        )
-        self.size_current_label.pack(fill="x", padx=4, pady=(0, 7))
-
-        self.size_buttons: dict[int, RoundedButton] = {}
-        for pct in (50, 75, 100, 150, 200):
-            button = self._menu_item(
-                self.size_page,
-                f"{pct}%",
-                lambda value=pct: self._set_scale(value),
-            )
-            self.size_buttons[pct] = button
-
-    def _build_indicator_page(self) -> None:
-        heading = tk.Frame(self.indicator_page, bg=self.bg)
-        heading.pack(fill="x", pady=(0, 9))
-        self._button(
-            heading,
-            "‹  返回",
-            self._show_more,
-            background=self.bg,
-            hover=self.accent_soft,
-            foreground=self.accent,
-            width=62,
-            height=28,
-        ).pack(side="left")
-        tk.Label(
-            heading,
-            text="辅助显示",
-            bg=self.bg,
-            fg=self.text,
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(6, 0))
-
-        self.indicator_toggle_btn = self._menu_item(
-            self.indicator_page, "", self._toggle_indicator,
-        )
-        self.indicator_position_btn = self._menu_item(
-            self.indicator_page, "", self._cycle_indicator_position,
-        )
-
-    def _show_main(self) -> None:
-        self.more_page.pack_forget()
-        self.size_page.pack_forget()
-        self.indicator_page.pack_forget()
-        self.main_page.pack(fill="both", expand=True)
-        self._schedule_fit()
-
-    def _show_more(self) -> None:
-        self.main_page.pack_forget()
-        self.size_page.pack_forget()
-        self.indicator_page.pack_forget()
-        self.more_page.pack(fill="both", expand=True)
-        self._schedule_fit()
-
-    def _show_sizes(self) -> None:
-        self.main_page.pack_forget()
-        self.more_page.pack_forget()
-        self.indicator_page.pack_forget()
-        self.size_page.pack(fill="both", expand=True)
-        self._schedule_fit()
-
-    def _show_indicator(self) -> None:
-        self.main_page.pack_forget()
-        self.more_page.pack_forget()
-        self.size_page.pack_forget()
-        self.indicator_page.pack(fill="both", expand=True)
-        self._schedule_fit()
+    def _action_item(
+        self,
+        parent,
+        text: str,
+        command,
+        *,
+        foreground: str | None = None,
+    ) -> RoundedButton:
+        """A menu item that runs *command* and then closes the whole menu
+        tree (actions like demo / self-test / hooks / exit)."""
+        def run() -> None:
+            try:
+                command()
+            finally:
+                self.hide()
+        return self._menu_item(parent, text, run, foreground=foreground)
 
     def _schedule_fit(self) -> None:
         if self.top.state() != "withdrawn":
@@ -471,18 +697,47 @@ class ControlPanel:
 
     def _fit_current_page(self) -> None:
         self.body.update_idletasks()
-        width = max(196, self.body.winfo_reqwidth() + 16)
+        width = max(MENU_MIN_WIDTH, self.body.winfo_reqwidth() + 16)  # 196 = 面板最小宽度
         height = self.body.winfo_reqheight() + 14
-        x = self.top.winfo_x()
-        y = self.top.winfo_y()
-        screen_w = self.top.winfo_screenwidth()
-        screen_h = self.top.winfo_screenheight()
-        x = min(max(8, x), max(8, screen_w - width - 8))
-        y = min(max(8, y), max(8, screen_h - height - 48))
+        x, y = self._clamped_menu_pos(
+            self.top.winfo_x(), self.top.winfo_y(), width, height
+        )
         self.top.geometry(f"{width}x{height}+{x}+{y}")
         self.top.update_idletasks()
         if sys.platform == "win32":
-            _win32_round_window_region(self.top.winfo_id(), width, height, 24)
+            _win32_round_window_region(self.top.winfo_id(), width, height, MENU_RADIUS)
+
+    def _clamped_menu_pos(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        x_shift: int = 0,
+        y_shift: int = 0,
+    ) -> tuple[int, int]:
+        """把菜单矩形钳制到最近显示器的工作区。
+
+        ``winfo_screenwidth()`` 只反映主显示器，桌宠位于副屏/负坐标屏时
+        会被错误钳回主屏。这里与 ``window.py:_screen_visible_geom`` 走同一
+        套解析链：最近显示器工作区 → 虚拟桌面外接矩形 → Tk 屏幕（非
+        Windows 兜底）。
+        """
+        x = int(x) + int(x_shift)
+        y = int(y) + int(y_shift)
+        bounds = _get_monitor_work_area_for_rect(x, y, width, height)
+        if bounds is None:
+            bounds = _get_virtual_screen_bounds()
+        if bounds is None:
+            left, top = 0, 0
+            right = self.top.winfo_screenwidth()
+            bottom = self.top.winfo_screenheight()
+        else:
+            left, top, right, bottom = bounds
+        # 四周留 8 px；底部额外留 48 px，避免菜单贴住任务栏/屏幕下缘。
+        inner = (left + 8, top + 8, right - 8, bottom - 48)
+        return _clamp_window_to_bounds(x, y, width, height, inner, margin=8)
 
     def _bind_drag(self, widget) -> None:
         widget.bind("<ButtonPress-1>", self._start_drag)
@@ -541,6 +796,9 @@ class ControlPanel:
             return
         sx, sy, x, y = self._drag
         self.top.geometry(f"+{x + event.x_root - sx}+{y + event.y_root - sy}")
+        # 拖动根菜单时让已打开的子菜单跟随锚定到父按钮。
+        for flyout in list(self._open_flyouts):
+            self._schedule_fit_flyout(flyout)
 
     def _set_scale(self, pct: int) -> None:
         self.window.set_scale(pct / 100)
@@ -584,10 +842,6 @@ class ControlPanel:
         self.window.toggle_indicator()
         self.refresh()
 
-    def _cycle_indicator_position(self) -> None:
-        self.window.cycle_indicator_position()
-        self.refresh()
-
     def _hide_pet(self) -> None:
         self.hide()
         self.window.hide_to_tray()
@@ -610,6 +864,9 @@ class ControlPanel:
             autohide,
             "查看后隐藏",
         )
+        self.size_btn.set_style(
+            text=f"桌宠大小  {round(self.window.scale * 100)}%  ›"
+        )
         self.hook_btn.set_style(
             text="Hooks ✓" if hook_enabled else "Hooks",
             foreground=self.accent if hook_enabled else self.text,
@@ -617,23 +874,19 @@ class ControlPanel:
             outline=self.accent_soft if hook_enabled else self.border,
         )
         self.autostart_btn.set_style(text=self.window._autostart_label)
-        self.size_btn.set_style(text=f"桌宠大小  {round(self.window.scale * 100)}%  ›")
 
         indicator_enabled = bool(self.window.indicator_enabled_var.get())
         self._set_toggle_style(
             self.indicator_toggle_btn, indicator_enabled, "显示状态与 Token"
         )
-        position_labels = {
-            "right": "右侧 · 纵向",
-            "bottom": "下方 · 横向",
-            "left": "左侧 · 纵向",
-            "top": "上方 · 横向",
-        }
-        self.indicator_position_btn.set_style(
-            text=f"位置  {position_labels[self.window.indicator_position]}",
-            foreground=self.text,
-            background=self.surface,
-        )
+
+        position = self.window.indicator_position
+        for pos, button in self.indicator_radio_buttons.items():
+            selected = pos == position
+            button.set_style(
+                foreground=self.accent if selected else self.muted,
+                background=self.accent_soft if selected else self.surface,
+            )
 
         current_pct = round(self.window.scale * 100)
         self.size_current_label.configure(
@@ -652,6 +905,11 @@ class ControlPanel:
         elif self.ack_btn.winfo_manager():
             self.ack_btn.pack_forget()
 
+        # 状态/勾选变化可能改变条目宽度，重排已打开的子菜单。
+        for flyout in list(self._open_flyouts):
+            self._schedule_fit_flyout(flyout)
+        self._schedule_fit()
+
     def _set_toggle_style(
         self,
         button: RoundedButton,
@@ -665,29 +923,40 @@ class ControlPanel:
         )
 
     def show_at(self, x: int, y: int) -> None:
-        self._show_main()
+        self._close_all()
         self.refresh()
         self.body.update_idletasks()
-        width = max(196, self.body.winfo_reqwidth() + 16)
+        width = max(MENU_MIN_WIDTH, self.body.winfo_reqwidth() + 16)
         height = self.body.winfo_reqheight() + 14
-        screen_w = self.top.winfo_screenwidth()
-        screen_h = self.top.winfo_screenheight()
-        x = min(max(8, x - width + 18), max(8, screen_w - width - 8))
-        y = min(max(8, y - 18), max(8, screen_h - height - 48))
+        x, y = self._clamped_menu_pos(
+            x, y, width, height,
+            x_shift=-width + 18,  # 光标右侧留一小段
+            y_shift=-18,          # 菜单出现在光标上方一点
+        )
         self.top.geometry(f"{width}x{height}+{x}+{y}")
         self.top.deiconify()
         self.top.update_idletasks()
         if sys.platform == "win32":
             _win32_round_window_region(
-                self.top.winfo_id(), width, height, 24
+                self.top.winfo_id(), width, height, MENU_RADIUS
             )
         self.top.lift()
         self.top.focus_force()
 
     def hide(self) -> None:
-        self.top.withdraw()
+        self._close_all()
+        try:
+            self.top.withdraw()
+        except tk.TclError:
+            pass
 
     def destroy(self) -> None:
+        self._close_all()
+        for flyout in self._flyouts.values():
+            try:
+                flyout.top.destroy()
+            except tk.TclError:
+                pass
         try:
             self.top.destroy()
         except tk.TclError:

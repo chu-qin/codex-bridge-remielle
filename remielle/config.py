@@ -42,6 +42,8 @@ _DEFAULT_CONFIG: dict = {
     "codex_sessions_dir": "%USERPROFILE%/.codex/sessions",
     "codex_global_state_path": "%USERPROFILE%/.codex/.codex-global-state.json",
     "claude_sessions_dir": "%USERPROFILE%/.claude/sessions",
+    "claude_projects_dir": "%USERPROFILE%/.claude/projects",
+    "claude_token_scan_interval_seconds": 3.0,
     "actions": {
         "startup": "待机.gif",
         "idle": "待机.gif",

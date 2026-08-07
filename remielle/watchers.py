@@ -108,7 +108,7 @@ class CodexSessionWatcher:
         if not self.sessions_dir.exists():
             self._file_cache = []
             self._file_cache_time = now
-            return []
+            return self._file_cache
         cutoff = now - self.recent_days * 86400
         files: list[tuple[float, Path]] = []
         try:
@@ -123,7 +123,7 @@ class CodexSessionWatcher:
         except OSError:
             self._file_cache = []
             self._file_cache_time = now
-            return []
+            return self._file_cache
         files.sort(key=lambda item: item[0])
         self._file_cache = [path for _, path in files]
         self._file_cache_time = now
@@ -428,7 +428,11 @@ class ClaudeSessionWatcher:
     """
 
     def __init__(self, sessions_dir: Path,
-                 scan_interval_seconds: float = 1.0) -> None:
+                 scan_interval_seconds: float = 1.0,
+                 projects_dir: Path | None = None,
+                 recent_days: int = 2,
+                 token_scan_interval_seconds: float = 3.0,
+                 token_file_cache_ttl_seconds: float = 1.0) -> None:
         self.sessions_dir = sessions_dir
         self._scan_interval = scan_interval_seconds
         self._last_mtime: float = 0.0
@@ -448,6 +452,29 @@ class ClaudeSessionWatcher:
         # Cache parsed session JSON by (path → (mtime_ns, data)) so we
         # don't re-read+parse files whose on-disk content hasn't changed.
         self._session_cache: dict[Path, tuple[int, dict]] = {}
+        # ── Claude Code token accounting ──
+        # Token snapshots live in ``~/.claude/projects/<project>/*.jsonl``
+        # at ``line["message"]["usage"]`` — NOT in the session JSON files
+        # that feed busy/idle status.  The project dir defaults to the
+        # sibling of the sessions dir.  Only numeric counters are retained
+        # (design rule 9 — message content is never kept).
+        self.projects_dir = (
+            Path(projects_dir) if projects_dir
+            else self.sessions_dir.parent / "projects"
+        )
+        self.recent_days = recent_days
+        self._token_scan_interval = max(0.0, token_scan_interval_seconds)
+        self._next_token_scan: float = 0.0  # monotonic time of next token scan
+        self._token_offsets: dict[Path, int] = {}
+        self._token_partial: dict[Path, bytes] = {}
+        self._usage_by_path: dict[Path, TokenUsage] = {}
+        self._token_file_cache: list[Path] | None = None
+        self._token_file_cache_time: float = 0.0
+        self._token_file_cache_ttl: float = max(0.25, token_file_cache_ttl_seconds)
+        self._busy_baselines: dict[Path, TokenUsage] = {}
+        self._active_files: set[Path] = set()
+        self._active_usage = TokenUsage()
+        self._review_usage = TokenUsage()
 
     def _read_session_cached(self, path: Path) -> dict | None:
         """Return parsed JSON for *path*, or ``None`` on error.
@@ -475,6 +502,161 @@ class ClaudeSessionWatcher:
     def is_busy(self) -> bool:
         """Return the cached busy state (updated by ``poll()``)."""
         return self._cached_busy
+
+    @property
+    def active_usage(self) -> TokenUsage:
+        """Token delta consumed by the current busy window (cumulative since
+        the turn started, across all recently-active project files)."""
+        return self._active_usage
+
+    @property
+    def review_usage(self) -> TokenUsage:
+        """Token delta frozen when the last busy window closed; shown while
+        the completed Claude task awaits review."""
+        return self._review_usage
+
+    # ── Token accounting ──────────────────────────────────────────────
+
+    def _recent_token_files(self) -> list[Path]:
+        """Return ``*.jsonl`` files under ``projects_dir`` modified within
+        ``recent_days``, cached briefly to avoid re-scanning the whole tree
+        every poll (mirrors ``CodexSessionWatcher._recent_files``)."""
+        now = time.time()
+        if (self._token_file_cache is not None
+                and now - self._token_file_cache_time < self._token_file_cache_ttl):
+            return self._token_file_cache
+        if not self.projects_dir.exists():
+            self._token_file_cache = []
+            self._token_file_cache_time = now
+            return self._token_file_cache
+        cutoff = now - self.recent_days * 86400
+        files: list[tuple[float, Path]] = []
+        try:
+            for path in self.projects_dir.rglob("*.jsonl"):
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime >= cutoff:
+                    files.append((mtime, path))
+        except OSError:
+            self._token_file_cache = []
+            self._token_file_cache_time = now
+            return self._token_file_cache
+        files.sort(key=lambda item: item[0])
+        self._token_file_cache = [path for _, path in files]
+        self._token_file_cache_time = now
+        return self._token_file_cache
+
+    def _process_token_line(self, raw: bytes, source_path: Path) -> None:
+        """Sum one Claude Code JSONL ``message.usage`` snapshot into the
+        per-file accumulator.  Only numeric counters are read; the transient
+        JSON parse is discarded immediately (rule 9)."""
+        if b'"usage"' not in raw:
+            return
+        try:
+            line = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        message = line.get("message") if isinstance(line, dict) else None
+        if not isinstance(message, dict):
+            return
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            return
+        parsed = TokenUsage.from_mapping(usage)
+        if parsed.total_tokens <= 0:
+            return
+        self._usage_by_path[source_path] = (
+            self._usage_by_path.get(source_path, TokenUsage()) + parsed
+        )
+
+    def _read_new_bytes(self, path: Path, from_start: bool = False) -> None:
+        """Incrementally follow ``path`` for new usage lines (mirrors
+        ``CodexSessionWatcher._read_new_bytes``).  A truncated/reset session
+        restarts the accumulator so a fresh conversation can never produce a
+        negative delta."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        previous = 0 if from_start else self._token_offsets.get(path, 0)
+        if size < previous:
+            previous = 0
+            self._token_partial[path] = b""
+            self._usage_by_path[path] = TokenUsage()
+            self._busy_baselines.pop(path, None)
+        if size == previous:
+            self._token_offsets[path] = size
+            return
+        try:
+            with path.open("rb") as handle:
+                handle.seek(previous)
+                data = handle.read()
+        except OSError:
+            return
+        self._token_offsets[path] = size
+        data = self._token_partial.get(path, b"") + data
+        lines = data.split(b"\n")
+        self._token_partial[path] = lines.pop() if lines else b""
+        for line in lines:
+            self._process_token_line(line.strip(), path)
+
+    def _begin_busy_window(self) -> None:
+        """Snapshot the per-file cumulative usage when a Claude turn starts,
+        so ``active_usage`` reflects only bytes written after the start.
+
+        When the watcher starts up while a session is *already* busy, the
+        accumulators are empty — read the recent files up to the current end
+        first so the baseline captures pre-window tokens instead of treating
+        the whole conversation as this turn's delta."""
+        if not self._usage_by_path:
+            for path in self._recent_token_files():
+                self._read_new_bytes(path)
+        self._busy_baselines = {
+            path: usage for path, usage in self._usage_by_path.items()
+            if usage.total_tokens > 0
+        }
+        self._active_files = set(self._busy_baselines)
+        self._active_usage = TokenUsage()
+
+    def _finish_busy_window(self) -> None:
+        """Freeze the current delta as the review usage and reset the window."""
+        self._review_usage = self._active_usage
+        self._active_usage = TokenUsage()
+        self._busy_baselines.clear()
+        self._active_files.clear()
+
+    def _scan_tokens_if_due(self, now: float, busy: bool) -> None:
+        """Read new usage bytes (own throttle — Claude is low-frequency, so
+        this never rides the 1 Hz status poll).  While ``busy``, newly seen
+        files are baselined and deltas accumulate into ``_active_usage``."""
+        if now < self._next_token_scan:
+            return
+        self._next_token_scan = now + self._token_scan_interval
+        if not self.projects_dir.exists():
+            return
+        try:
+            for path in self._recent_token_files():
+                if busy and path not in self._busy_baselines:
+                    self._busy_baselines[path] = self._usage_by_path.get(
+                        path, TokenUsage()
+                    )
+                    self._active_files.add(path)
+                self._read_new_bytes(path)
+                if busy:
+                    self._active_files.add(path)
+        except OSError:
+            pass
+        if busy:
+            usage = TokenUsage()
+            for path in self._active_files:
+                baseline = self._busy_baselines.get(path)
+                if baseline is not None:
+                    usage = usage + self._usage_by_path.get(
+                        path, TokenUsage()
+                    ).delta_from(baseline)
+            self._active_usage = usage
 
     def poll(self) -> tuple[bool, float, list[dict]]:
         """Return ``(is_busy, last_activity_monotonic, completions)``.
@@ -569,6 +751,18 @@ class ClaudeSessionWatcher:
                         self._updated_ats[pid] = updated_at
         except OSError:
             pass
+
+        # ── Token accounting: busy-window transitions ──
+        # Snapshot per-file baselines when a busy window opens so only bytes
+        # written *after* the turn started count toward the delta; freeze the
+        # delta into ``_review_usage`` when it closes.  The token scan itself
+        # is throttled (Claude is low-frequency), so it never adds per-poll
+        # I/O to the 1 Hz status scan.
+        if busy and not self._cached_busy:
+            self._begin_busy_window()
+        elif self._cached_busy and not busy:
+            self._finish_busy_window()
+        self._scan_tokens_if_due(now_mono, busy)
 
         # ── Detect busy → idle transitions ──
         for pid, info in list(self._busy_sessions.items()):

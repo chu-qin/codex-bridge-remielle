@@ -2,6 +2,31 @@ from __future__ import annotations
 
 import sys
 
+
+def _clamp_window_to_bounds(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    bounds: tuple[int, int, int, int],
+    margin: int,
+) -> tuple[int, int]:
+    """Keep a window fully visible when it fits, otherwise keep a handle."""
+    left, top, right, bottom = bounds
+    area_width = max(1, right - left)
+    area_height = max(1, bottom - top)
+    margin = max(1, int(margin))
+    if width <= area_width:
+        x = max(left, min(int(x), right - width))
+    else:
+        x = max(left - width + margin, min(int(x), right - margin))
+    if height <= area_height:
+        y = max(top, min(int(y), bottom - height))
+    else:
+        y = max(top - height + margin, min(int(y), bottom - margin))
+    return x, y
+
+
 if sys.platform == "win32":
     import ctypes as _ctypes
     from ctypes import wintypes as _w32
